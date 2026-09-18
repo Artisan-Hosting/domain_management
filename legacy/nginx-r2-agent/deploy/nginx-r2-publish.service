@@ -1,0 +1,15 @@
+[Unit]
+Description=nginx-r2-agent publish (issues certs, publishes nginx config to R2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nginx-r2-agent publish
+Restart=on-failure
+RestartSec=5s
+EnvironmentFile=/etc/nginx-r2-agent/publish.env
+User=root
+
+[Install]
+WantedBy=multi-user.target

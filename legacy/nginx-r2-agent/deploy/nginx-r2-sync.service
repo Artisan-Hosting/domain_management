@@ -1,0 +1,16 @@
+[Unit]
+Description=nginx-r2-agent sync (pulls nginx config from R2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nginx-r2-agent sync
+Restart=on-failure
+RestartSec=5s
+EnvironmentFile=/etc/nginx-r2-agent/sync.env
+# Needs root to write /etc/nginx and reload via systemctl.
+User=root
+
+[Install]
+WantedBy=multi-user.target
