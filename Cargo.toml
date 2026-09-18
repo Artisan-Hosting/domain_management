@@ -11,10 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Platform conventions: logging, Claims/Role types shared with ais_auth and Portal.
-# TEMPORARY local path for the resource-taxonomy migration -- 7.0.0 isn't
-# published yet. MUST be reverted to a registry pin (artisan_middleware =
-# "7.0.0") before this is ever pushed/merged.
-artisan_middleware = { path = "../../Libraries/artisan_lib" }
+artisan_middleware = "7.0.0"
 
 # gRPC. 0.14 to match watchdog -- Portal generates its client from its own
 # (0.11) toolchain, which is fine: the wire format is what has to agree.
