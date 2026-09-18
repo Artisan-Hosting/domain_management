@@ -1,0 +1,566 @@
+// --- proto/domains.proto ---
+//
+// The whole domain + SSL lifecycle: buy (Stripe -> Cloudflare Registrar) or
+// bring your own, DNS, certificates, nginx vhost, publish to R2.
+//
+// Token convention matches accounts.proto: reads take the caller's
+// `access_token`; writes that spend money or destroy state take an
+// `elevated_token` (a short-TTL token minted by ais_auth's ElevateSession
+// after a fresh password check). ais_domains re-validates both against
+// ais_auth itself rather than trusting Portal's say-so.
+syntax = "proto3";
+package domains;
+
+service DomainService {
+  // --- purchasing -----------------------------------------------------
+  // Search is cached//browsing-grade; Quote hits the registry live and is
+  // the only price a purchase may be built on.
+  rpc SearchDomains(SearchRequest) returns (SearchResponse);
+  rpc QuoteDomain(QuoteRequest) returns (QuoteResponse);
+  rpc CreateOrder(CreateOrderRequest) returns (OrderCheckout);
+  rpc GetOrder(GetOrderRequest) returns (Order);
+  rpc ListOrders(ListOrdersRequest) returns (ListOrdersResponse);
+
+  // Called only by Portal's /v1/webhooks/stripe, which forwards the raw
+  // request body and the Stripe-Signature header untouched. This service
+  // verifies the signature; a domain is never registered because a browser
+  // claimed the payment succeeded.
+  rpc HandleStripeWebhook(StripeWebhookRequest) returns (StripeWebhookResponse);
+
+  // --- lifecycle ------------------------------------------------------
+  rpc AddDomain(AddDomainRequest) returns (AddDomainResponse);
+  rpc GetDomain(GetDomainRequest) returns (Domain);
+  rpc ListDomains(ListDomainsRequest) returns (ListDomainsResponse);
+  rpc RemoveDomain(RemoveDomainRequest) returns (RemoveDomainResponse);
+  rpc VerifyDomainNow(VerifyDomainRequest) returns (Domain);
+  rpc WatchDomain(WatchDomainRequest) returns (stream DomainEvent);
+
+  // --- vhosts ---------------------------------------------------------
+  rpc AttachDomain(AttachDomainRequest) returns (Domain);
+  rpc DetachDomain(DetachDomainRequest) returns (Domain);
+
+  // --- members --------------------------------------------------------
+  // Cloudflare account invites scoped to one zone, so a customer can manage
+  // the DNS of the domain they bought and nothing else.
+  rpc InviteDomainMember(InviteDomainMemberRequest) returns (DomainMember);
+  rpc ListDomainMembers(ListDomainMembersRequest) returns (ListDomainMembersResponse);
+  rpc RemoveDomainMember(RemoveDomainMemberRequest) returns (RemoveDomainMemberResponse);
+
+  // --- adoption and attachment ----------------------------------------
+  //
+  // The system that existed before this service: domains discovered by
+  // scanning the nginx tree and the old domains.txt, recorded with no
+  // organization until someone attaches them. Attaching is an ordinary
+  // operation here, not a migration one-off -- org structure is still
+  // settling, so a domain may be re-attached many times.
+  rpc AssignDomain(AssignDomainRequest) returns (Domain);
+  rpc ListInventory(ListInventoryRequest) returns (ListInventoryResponse);
+  rpc ListFindings(ListFindingsRequest) returns (ListFindingsResponse);
+  rpc RescanInventory(RescanRequest) returns (RescanResponse);
+  rpc ListAdoptedVhosts(ListAdoptedVhostsRequest) returns (ListAdoptedVhostsResponse);
+  rpc ConvertVhost(ConvertVhostRequest) returns (ConvertVhostResponse);
+
+  // --- ops (Admin/Super) ----------------------------------------------
+  rpc ListCertificates(ListCertificatesRequest) returns (ListCertificatesResponse);
+  rpc ForceRenew(ForceRenewRequest) returns (ForceRenewResponse);
+  rpc PublishNow(PublishNowRequest) returns (Release);
+  rpc ListReleases(ListReleasesRequest) returns (ListReleasesResponse);
+}
+
+// ---------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------
+
+enum DomainSource {
+  DOMAIN_SOURCE_UNSPECIFIED = 0;
+  DOMAIN_SOURCE_PURCHASED = 1;  // bought through us, in our Cloudflare account
+  DOMAIN_SOURCE_BYO = 2;        // customer's own registrar, they point DNS at us
+  DOMAIN_SOURCE_IMPORTED = 3;   // was in /etc/acme-sh/domains.txt before this service
+}
+
+enum DomainStatus {
+  DOMAIN_STATUS_UNSPECIFIED = 0;
+  DOMAIN_STATUS_PENDING_PAYMENT = 1;
+  DOMAIN_STATUS_REGISTERING = 2;
+  DOMAIN_STATUS_PROVISIONING_DNS = 3;
+  DOMAIN_STATUS_PENDING_DNS = 4;   // BYO: waiting on the customer's records
+  DOMAIN_STATUS_ISSUING = 5;
+  DOMAIN_STATUS_ACTIVE = 6;
+  DOMAIN_STATUS_RENEWING = 7;
+  DOMAIN_STATUS_ERROR = 8;
+  DOMAIN_STATUS_REMOVED = 9;
+}
+
+enum OrderState {
+  ORDER_STATE_UNSPECIFIED = 0;
+  ORDER_STATE_AWAITING_PAYMENT = 1;
+  ORDER_STATE_PAID = 2;
+  ORDER_STATE_REGISTERING = 3;
+  ORDER_STATE_COMPLETED = 4;
+  ORDER_STATE_REFUNDED = 5;
+  ORDER_STATE_FAILED = 6;
+  ORDER_STATE_NEEDS_ADMIN = 7;  // Cloudflare returned action_required
+}
+
+enum KeyType {
+  KEY_TYPE_UNSPECIFIED = 0;
+  KEY_TYPE_ECC = 1;   // ECDSA P-256
+  KEY_TYPE_RSA = 2;   // RSA 4096
+}
+
+enum RecordPurpose {
+  RECORD_PURPOSE_UNSPECIFIED = 0;
+  RECORD_PURPOSE_EDGE_A = 1;
+  RECORD_PURPOSE_EDGE_AAAA = 2;
+  RECORD_PURPOSE_WWW = 3;
+  RECORD_PURPOSE_ACME_ALIAS = 4;
+}
+
+enum MemberStatus {
+  MEMBER_STATUS_UNSPECIFIED = 0;
+  MEMBER_STATUS_PENDING = 1;
+  MEMBER_STATUS_ACCEPTED = 2;
+  MEMBER_STATUS_REMOVED = 3;
+}
+
+// ---------------------------------------------------------------------
+// Core types
+// ---------------------------------------------------------------------
+
+message Money {
+  int64 amount_cents = 1;
+  string currency = 2;  // ISO 4217, e.g. "USD"
+}
+
+message Domain {
+  string id = 1;
+  string fqdn = 2;
+  string organization_id = 3;
+  string runner_id = 4;          // empty when not attached to a project
+  DomainSource source = 5;
+  DomainStatus status = 6;
+  string cf_zone_id = 7;
+  string challenge_target = 8;   // where _acme-challenge.<fqdn> must CNAME to
+  int64 expires_at = 9;          // registry expiry, unix seconds; 0 for BYO
+  bool auto_renew = 10;
+  string last_error = 11;
+  int64 created_at = 12;
+  int64 updated_at = 13;
+  repeated Certificate certificates = 14;
+  repeated ManagedRecord records = 15;
+  bool has_vhost = 16;
+}
+
+message Certificate {
+  string domain_id = 1;
+  KeyType key_type = 2;
+  string serial = 3;
+  int64 not_before = 4;
+  int64 not_after = 5;
+  int64 renew_after = 6;
+  int32 fail_count = 7;
+  string last_error = 8;
+}
+
+message ManagedRecord {
+  RecordPurpose purpose = 1;
+  string type = 2;     // A, AAAA, CNAME
+  string name = 3;
+  string content = 4;
+  string cf_record_id = 5;
+  bool drifted = 6;    // present in our DB, different or missing at Cloudflare
+}
+
+message DomainMember {
+  string domain_id = 1;
+  string email = 2;
+  string cf_member_id = 3;
+  string role = 4;     // Cloudflare role name, e.g. "Domain DNS"
+  MemberStatus status = 5;
+  int64 invited_at = 6;
+}
+
+message Order {
+  string id = 1;
+  string fqdn = 2;
+  string organization_id = 3;
+  string user_id = 4;
+  Money cost = 5;              // what Cloudflare charges us
+  Money price = 6;             // what the customer pays
+  OrderState state = 7;
+  string cf_workflow_state = 8;
+  string stripe_payment_intent_id = 9;
+  string domain_id = 10;       // set once the registration succeeds
+  string last_error = 11;
+  int64 created_at = 12;
+  int64 updated_at = 13;
+}
+
+message Release {
+  string release_id = 1;
+  int32 file_count = 2;
+  string manifest_sha256 = 3;
+  string status = 4;
+  int64 created_at = 5;
+}
+
+// ---------------------------------------------------------------------
+// Purchasing
+// ---------------------------------------------------------------------
+
+message DomainOffer {
+  string fqdn = 1;
+  bool registrable = 2;
+  string reason = 3;      // Cloudflare's reason when not registrable
+  string tier = 4;        // only "standard" is sellable
+  Money price = 5;        // our price, markup already applied
+}
+
+message SearchRequest {
+  string access_token = 1;
+  string query = 2;
+  int32 limit = 3;
+}
+
+message SearchResponse {
+  repeated DomainOffer offers = 1;
+}
+
+message QuoteRequest {
+  string access_token = 1;
+  string fqdn = 2;
+}
+
+message QuoteResponse {
+  string quote_id = 1;
+  DomainOffer offer = 2;
+  int64 expires_at = 3;   // quotes are short-lived; CreateOrder re-checks anyway
+}
+
+message CreateOrderRequest {
+  string access_token = 1;
+  string quote_id = 2;
+  string organization_id = 3;           // must match the caller's org unless Super
+  string runner_id = 4;        // optional: attach on success
+  string invite_email = 5;     // optional: who to invite to the zone afterwards
+}
+
+message OrderCheckout {
+  Order order = 1;
+  string stripe_client_secret = 2;
+  string stripe_publishable_key = 3;
+}
+
+message GetOrderRequest {
+  string access_token = 1;
+  string order_id = 2;
+}
+
+message ListOrdersRequest {
+  string access_token = 1;
+  string organization_id = 2;   // Super may pass another org; others are forced to their own
+  int32 limit = 3;
+  int32 offset = 4;
+}
+
+message ListOrdersResponse {
+  repeated Order orders = 1;
+}
+
+message StripeWebhookRequest {
+  bytes payload = 1;       // the raw body, byte for byte
+  string signature = 2;    // the Stripe-Signature header
+}
+
+message StripeWebhookResponse {
+  bool handled = 1;
+}
+
+// ---------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------
+
+message AddDomainRequest {
+  string access_token = 1;
+  string fqdn = 2;
+  string organization_id = 3;
+  string runner_id = 4;   // optional
+}
+
+// What a BYO customer has to create at their own DNS host before anything
+// can be issued.
+message RequiredRecord {
+  string type = 1;
+  string name = 2;
+  string content = 3;
+  string note = 4;
+}
+
+message AddDomainResponse {
+  Domain domain = 1;
+  repeated RequiredRecord required_records = 2;
+}
+
+message GetDomainRequest {
+  string access_token = 1;
+  string id_or_fqdn = 2;
+}
+
+message ListDomainsRequest {
+  string access_token = 1;
+  string organization_id = 2;
+  string runner_id = 3;
+  DomainStatus status = 4;   // UNSPECIFIED means any
+  int32 limit = 5;
+  int32 offset = 6;
+}
+
+message ListDomainsResponse {
+  repeated Domain domains = 1;
+}
+
+message RemoveDomainRequest {
+  string elevated_token = 1;
+  string id_or_fqdn = 2;
+  bool delete_zone = 3;       // also delete the Cloudflare zone
+  bool keep_registration = 4; // never cancels a registration; this is documentation
+}
+
+message RemoveDomainResponse {
+  bool success = 1;
+}
+
+message VerifyDomainRequest {
+  string access_token = 1;
+  string id_or_fqdn = 2;
+}
+
+message WatchDomainRequest {
+  string access_token = 1;
+  string id_or_fqdn = 2;   // empty: every domain the caller may see
+}
+
+message DomainEvent {
+  string domain_id = 1;
+  string fqdn = 2;
+  DomainStatus status = 3;
+  string message = 4;
+  int64 at = 5;
+}
+
+// ---------------------------------------------------------------------
+// Vhosts
+// ---------------------------------------------------------------------
+
+// One deployed instance of a runner.
+//
+// The address is assembled as `ahpn-<node_id>.ah.internal:<port>`: the node
+// id with the internal domain glued on, and the port out of that instance's
+// own config. The caller placed the repo on the node and read its config, so
+// it is the one that knows both.
+message Backend {
+  string node_id = 1;
+  uint32 port = 2;
+}
+
+message AttachDomainRequest {
+  string access_token = 1;
+  string id_or_fqdn = 2;
+  string runner_id = 3;
+  // Every instance to send traffic to. More than one becomes a balanced
+  // upstream; the vhost is rewritten whenever this list changes, which is
+  // how scaling out reaches the edge.
+  repeated Backend backends = 4;
+  // Additional names on the same certificate, `www.<domain>` being the usual.
+  repeated string extra_names = 5;
+  // Emit the port-80 server redirecting to HTTPS. Default on.
+  bool no_http_redirect = 6;
+}
+
+message DetachDomainRequest {
+  string access_token = 1;
+  string id_or_fqdn = 2;
+}
+
+// ---------------------------------------------------------------------
+// Members
+// ---------------------------------------------------------------------
+
+message InviteDomainMemberRequest {
+  string access_token = 1;
+  string id_or_fqdn = 2;
+  string email = 3;
+  string role = 4;   // defaults to the configured role, normally "Domain DNS"
+}
+
+message ListDomainMembersRequest {
+  string access_token = 1;
+  string id_or_fqdn = 2;
+}
+
+message ListDomainMembersResponse {
+  repeated DomainMember members = 1;
+}
+
+message RemoveDomainMemberRequest {
+  string access_token = 1;
+  string id_or_fqdn = 2;
+  string email = 3;
+}
+
+message RemoveDomainMemberResponse {
+  bool success = 1;
+}
+
+// ---------------------------------------------------------------------
+// Ops
+// ---------------------------------------------------------------------
+
+message ListCertificatesRequest {
+  string access_token = 1;
+  string organization_id = 2;
+  int32 expiring_within_days = 3;  // 0 means all
+}
+
+message ListCertificatesResponse {
+  repeated Certificate certificates = 1;
+}
+
+message ForceRenewRequest {
+  string elevated_token = 1;
+  string id_or_fqdn = 2;
+  KeyType key_type = 3;   // UNSPECIFIED means both
+}
+
+message ForceRenewResponse {
+  string job_id = 1;
+}
+
+message PublishNowRequest {
+  string elevated_token = 1;
+  bool dry_run = 2;   // stage and nginx -t, but do not upload
+}
+
+message ListReleasesRequest {
+  string access_token = 1;
+  int32 limit = 2;
+}
+
+message ListReleasesResponse {
+  repeated Release releases = 1;
+}
+
+// ---------------------------------------------------------------------
+// Adoption and attachment
+// ---------------------------------------------------------------------
+
+message AssignDomainRequest {
+  string access_token = 1;
+  // Required only to move a domain that already has an organization --
+  // taking something from one tenant and giving it to another costs a fresh
+  // password check, the same bar ais_auth sets for its own org writes.
+  string elevated_token = 2;
+  string id_or_fqdn = 3;
+  // Empty string leaves the current value alone; clearing is deliberate and
+  // uses `clear_org` / `clear_runner` so "not specified" and "remove it"
+  // cannot be confused.
+  string organization_id = 4;
+  string runner_id = 5;
+  bool clear_org = 6;
+  bool clear_runner = 7;
+}
+
+message InventoryEntry {
+  string id = 1;
+  string fqdn = 2;
+  string organization_id = 3;        // empty when unassigned, which is a normal state
+  string runner_id = 4;
+  DomainSource source = 5;
+  DomainStatus status = 6;
+  bool serves_tls = 7;
+  repeated string vhost_paths = 8;
+  repeated string cert_dirs = 9;
+  int64 expires_at = 10;
+  repeated string findings = 11;
+}
+
+message ListInventoryRequest {
+  string access_token = 1;
+  string organization_id = 2;
+  // The migration view: everything still waiting to be attached to something.
+  bool unassigned_only = 3;
+  int32 limit = 4;
+  int32 offset = 5;
+}
+
+message ListInventoryResponse {
+  repeated InventoryEntry entries = 1;
+  int32 total = 2;
+  int32 unassigned = 3;
+}
+
+message FindingEntry {
+  string code = 1;
+  string severity = 2;
+  string subject = 3;
+  string message = 4;
+  int64 first_seen = 5;
+  int64 last_seen = 6;
+  int64 resolved_at = 7;   // 0 while still open
+}
+
+message ListFindingsRequest {
+  string access_token = 1;
+  string code = 2;         // empty for all
+  string severity = 3;     // info | warn | error, empty for all
+  bool open_only = 4;
+  int32 limit = 5;
+}
+
+message ListFindingsResponse {
+  repeated FindingEntry findings = 1;
+}
+
+message RescanRequest {
+  string access_token = 1;
+  bool check_dns = 2;
+  bool check_cloudflare = 3;
+}
+
+message RescanResponse {
+  int64 scan_id = 1;
+  int32 domain_count = 2;
+  int32 finding_count = 3;
+  int32 server_count = 4;
+}
+
+message AdoptedVhost {
+  string path = 1;
+  string domain_fqdn = 2;
+  repeated string server_names = 3;
+  string file_sha256 = 4;
+  // The file changed on disk since it was adopted.
+  bool drifted = 5;
+}
+
+message ListAdoptedVhostsRequest {
+  string access_token = 1;
+  string organization_id = 2;
+}
+
+message ListAdoptedVhostsResponse {
+  repeated AdoptedVhost vhosts = 1;
+}
+
+message ConvertVhostRequest {
+  string elevated_token = 1;
+  string id_or_fqdn = 2;
+  string template = 3;
+  // Always run this first: converting replaces a file someone wrote by hand.
+  bool dry_run = 4;
+}
+
+message ConvertVhostResponse {
+  string diff = 1;
+  bool converted = 2;
+}

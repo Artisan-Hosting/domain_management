@@ -1,0 +1,19 @@
+[Unit]
+Description=Artisan Hosting domain + SSL management
+After=network.target
+
+[Service]
+Type=simple
+KillMode=mixed
+ExecStart=/opt/artisan/bin/ais_domains serve
+Restart=on-failure
+RestartSec=5
+Environment="RUST_LOG=info"
+# Certificate private keys are written 0600 by this service; a permissive
+# umask inherited from elsewhere must not loosen anything it creates.
+UMask=0077
+StandardOutput=file:/var/log/ais_domains.log
+StandardError=file:/var/log/ais_domains_error.log
+
+[Install]
+WantedBy=multi-user.target

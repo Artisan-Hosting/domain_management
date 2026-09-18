@@ -1,0 +1,63 @@
+[package]
+name = "ais_domains"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+default-run = "ais_domains"
+
+[[bin]]
+name = "ais_domains"
+path = "src/main.rs"
+
+[dependencies]
+# Platform conventions: logging, Claims/Role types shared with ais_auth and Portal.
+# TEMPORARY local path for the resource-taxonomy migration -- 7.0.0 isn't
+# published yet. MUST be reverted to a registry pin (artisan_middleware =
+# "7.0.0") before this is ever pushed/merged.
+artisan_middleware = { path = "../../Libraries/artisan_lib" }
+
+# gRPC. 0.14 to match watchdog -- Portal generates its client from its own
+# (0.11) toolchain, which is fine: the wire format is what has to agree.
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
+tonic-reflection = "0.14"
+prost = "0.14"
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "process", "time", "net", "fs"] }
+tokio-stream = "0.1"
+
+# Unlike ais_auth, this service runs its own migrations (see migrations/).
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "mysql", "chrono", "migrate"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+thiserror = "2"
+once_cell = "1"
+hex = "0.4"
+sha2 = "0.10"
+instant-acme = "0.8"
+rcgen = { version = "0.14", features = ["aws_lc_rs", "pem"] }
+hickory-resolver = "0.26"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "charset", "http2"] }
+x509-parser = "0.18"
+uuid = { version = "1", features = ["v4"] }
+aws-sdk-s3 = "1"
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+json_comments = "0.2"
+psl = "2"
+glob = "0.3"
+rpassword = "7"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[dev-dependencies]
+serde_json = "1"
+time = { version = "0.3", features = ["std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

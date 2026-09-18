@@ -1,0 +1,101 @@
+// ais_domains configuration. Install at /opt/artisan/etc/ais_domains.json.
+// Credentials do NOT belong here -- they live in ais_domains.env (mode 0600).
+// Comments are stripped before parsing, so annotate freely.
+// Every value below is the built-in default unless marked REQUIRED.
+{
+  "grpc": {
+    // Private network only; Portal is the single public entry point.
+    "bind": "0.0.0.0:50055",
+    "reflection": true
+  },
+
+  "auth": {
+    // ais_auth's AccountInternal service -- the same address Portal uses.
+    // Organizations and runners are read from here and nowhere else.
+    "grpc_addr": "http://10.2.0.2:50051",
+    "token_cache_secs": 60
+  },
+
+  "acme": {
+    // Start here. Flip to false only once a staging issuance has gone end to end.
+    "staging": true,
+    "contact_email": "ops@artisanhosting.net",
+    "account_key_path": "/opt/artisan/etc/ais_domains_acme.key",
+    // The zone that holds every _acme-challenge TXT record.
+    "alias_zone": "artisanhosting.net",
+    "alias_zone_id": "",            // REQUIRED: Cloudflare zone id for alias_zone
+    "alias_subdomain": "acme",      // new domains CNAME to <hash>.acme.artisanhosting.net
+    // What domains adopted from domains.txt already point at.
+    "legacy_challenge_target": "_acme-challenge.artisanhosting.net",
+    "renew_before_days": 30,
+    "propagation_timeout_secs": 300
+  },
+
+  "cloudflare": {
+    "api_base": "https://api.cloudflare.com/client/v4",
+    // Narrowest domain-scoped role that still lets a customer manage their DNS.
+    "member_role": "Domain DNS",
+    "timeout_secs": 30
+  },
+
+  "dns": {
+    // The edge IPs a domain must resolve to before we spend a rate-limit slot
+    // on it -- the old EXPECTED_IPS. Empty disables the check.
+    "edge_ipv4": [],
+    "edge_ipv6": [],
+    "resolvers": ["1.1.1.1:53", "8.8.8.8:53"],
+    "verify_interval_secs": 120,
+    "verify_give_up_hours": 168,
+    "reconcile_interval_secs": 3600
+  },
+
+  "tree": {
+    // Where the tree lives on the publisher (the agent's SOURCE_TREE).
+    "root": "/mnt/nginx_local",
+    // Where the same tree lands on an edge, and therefore what the absolute
+    // paths inside the configs mean. A snippet says
+    // /etc/nginx/certs/_.example.com/ecc.pem; without this, every certificate
+    // reference looks broken when scanned from the publisher.
+    "deployed_root": "/etc/nginx",
+    "certs_dir": "certs",
+    // Vhosts, one file per site, conventionally with no extension.
+    "sites_dir": "sites-enabled",
+    // The per-zone <name>_cert.conf files that link a vhost to its ECDSA and
+    // RSA pair. Issuance writes one for each new domain.
+    "snippets_dir": "snippets",
+    "nginx_bin": "/sbin/nginx",
+    "work_root": "/opt/nginx-publisher",
+    "keep_stage": false
+  },
+
+  "publish": {
+    "bucket": "certificate-bucket-1",
+    "prefix": "nginx",
+    // REQUIRED: https://<account>.r2.cloudflarestorage.com
+    "endpoint": "",
+    "region": "auto",
+    "debounce_secs": 60,
+    "keep_releases": 10,
+    // Uploads the release but leaves `latest` alone, so edges ignore it.
+    // Phase 1 runs this way beside the Go publisher until manifests match.
+    "shadow_mode": true
+  },
+
+  "pricing": {
+    "markup_percent": 20.0,
+    "min_margin_cents": 300,
+    "max_price_cents": 10000,
+    "currency": "USD",
+    "tld_allowlist": ["com", "net", "org", "dev", "app", "io"],
+    "quote_ttl_secs": 600
+  },
+
+  "purchasing": {
+    // Kill switch. Nothing can be bought until this is deliberately turned on.
+    "enabled": false,
+    "orders_per_org_per_day": 5,
+    "monthly_cap_cents": 50000,
+    "renewal_charge_days_before": 30,
+    "renewal_giveup_days_before": 7
+  }
+}

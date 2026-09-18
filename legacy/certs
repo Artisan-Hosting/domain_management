@@ -1,0 +1,154 @@
+#!/bin/bash
+
+# acme_bulk_issue.sh
+# Issue ECDSA (ec-256) and RSA (4096) certs for a list of domains using acme.sh + DNS-01 (Cloudflare).
+# - Reads domains from a file (default: /etc/acme-sh/domains.txt)
+# - Optional gating: skip domains whose A/AAAA don't point at EXPECTED_IPS
+# - Uses challenge-alias (CNAME method) so you can centralize TXT writes in one zone
+
+set -Eeuo pipefail
+
+DOMAINS_FILE="${1:-/etc/acme-sh/domains.txt}"
+
+# --- Config (env-overridable) -----------------------------------------------
+CHALLENGE_ALIAS="${CHALLENGE_ALIAS:-artisanhosting.net}"   # your alias zone (NO _acme-challenge. prefix)
+DNS_PLUGIN="${DNS_PLUGIN:-dns_cf}"                         # acme.sh DNS plugin
+ENV_FILE="${ENV_FILE:-/etc/acme-sh/cloudflare.env}"        # exports CF_Token, CF_Zone_ID, CF_Account_ID
+EXPECTED_IPS="${EXPECTED_IPS:-}" # space-separated list of IPs your domains should point to
+STAGING="${STAGING:-0}"                                    # 1 = use Let's Encrypt staging for tests
+ACME_SH_BIN="${ACME_SH_BIN:-$HOME/.acme.sh/acme.sh}"       # path to acme.sh
+ENFORCE_ALIAS="${ENFORCE_ALIAS:-0}"                        # 1 = require correct CNAME to alias or skip
+SLEEP_JITTER="${SLEEP_JITTER:-2}"                          # seconds between domains (avoid burstiness)
+CHECK_WWW="${CHECK_WWW:-0}"                                # 1 = also check www.<domain> for IP match
+FORCE="${FORCE:-0}"                                        # Force renew certs when we fuck up
+# ----------------------------------------------------------------------------
+
+log() { printf '%s [acme-bulk] %s\n' "$(date -Is)" "$*"; }
+
+# Load Cloudflare env if present (safe no-op if missing and you already exported vars)
+if [[ -f "$ENV_FILE" ]]; then
+  set -a; # export what the file sets
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
+
+# Basic deps check
+command -v dig >/dev/null || { log "ERROR: 'dig' not found (install dnsutils)."; exit 1; }
+[[ -x "$ACME_SH_BIN" ]] || { log "ERROR: acme.sh not found at $ACME_SH_BIN"; exit 1; }
+
+ip_matches() {
+  # Returns 0 if the domain (and optionally www.domain) resolves to one of EXPECTED_IPS, or if EXPECTED_IPS is empty.
+  local domain="$1"; shift
+  [[ -z "$EXPECTED_IPS" ]] && return 0
+
+  mapfile -t ips < <(dig +short A "$domain"; dig +short AAAA "$domain")
+  if [[ "$CHECK_WWW" == "1" ]]; then
+    mapfile -t ips_www < <(dig +short A "www.$domain"; dig +short AAAA "www.$domain")
+    ips+=("${ips_www[@]}")
+  fi
+
+  [[ "${#ips[@]}" -eq 0 ]] && return 1
+  local ip eip
+  for ip in "${ips[@]}"; do
+    for eip in $EXPECTED_IPS; do
+      [[ "$ip" == "$eip" ]] && return 0
+    done
+  done
+  return 1
+}
+
+alias_cname_ok() {
+  # Returns 0 if _acme-challenge.<domain> CNAMEs to _acme-challenge.<CHALLENGE_ALIAS>.
+  local domain="$1"
+  local want="_acme-challenge.${CHALLENGE_ALIAS}."
+  local got
+  got="$(dig +short "_acme-challenge.${domain}" CNAME || true)"
+  [[ "$got" == "$want" ]]
+}
+
+issue_pair() {
+  local domain="$1"
+  local extra=()
+  [[ "$STAGING" == "1" ]] && extra+=(--staging)
+  [[ "$FORCE" == "1" ]] && extra+=(--force)
+
+  # Creating cert directory
+  CERT_DIR="/mnt/nginx_local/certs/_.${domain}"
+  mkdir -p "$CERT_DIR"
+
+  # Issue ECDSA first
+  if ! "$ACME_SH_BIN" --issue \
+    -d "$domain" -d "*.$domain" \
+    --dns "$DNS_PLUGIN" \
+    --challenge-alias "$CHALLENGE_ALIAS" \
+    --keylength ec-256 \
+    --log \
+    "${extra[@]}"
+  then
+    log "ERROR: ECDSA issuance failed for $domain"
+#    Why tf would we delete the dir ?
+#    rm -rf "$CERT_DIR"
+    return 1
+  fi
+
+  # Issue RSA second
+  if ! "$ACME_SH_BIN" --issue \
+    -d "$domain" -d "*.$domain" \
+    --dns "$DNS_PLUGIN" \
+    --challenge-alias "$CHALLENGE_ALIAS" \
+    --keylength 4096 \
+    --log \
+    "${extra[@]}"
+  then
+    log "ERROR: RSA issuance failed for $domain"
+#    rm -rf "$CERT_DIR"
+    return 1
+  fi
+
+  # Copy RSA certs
+  cp "$HOME/.acme.sh/$domain/fullchain.cer" "$CERT_DIR/rsa.pem" || { log "ERROR: Missing RSA fullchain for $domain"; rm -rf "$CERT_DIR"; return 1; }
+  cp "$HOME/.acme.sh/$domain/$domain.key"   "$CERT_DIR/rsa.key" || { log "ERROR: Missing RSA key for $domain"; rm -rf "$CERT_DIR"; return 1; }
+
+  # Copy ECC certs
+  cp "$HOME/.acme.sh/${domain}_ecc/fullchain.cer" "$CERT_DIR/ecc.pem" || { log "ERROR: Missing ECC fullchain for $domain"; rm -rf "$CERT_DIR"; return 1; }
+  cp "$HOME/.acme.sh/${domain}_ecc/$domain.key"   "$CERT_DIR/ecc.key" || { log "ERROR: Missing ECC key for $domain"; rm -rf "$CERT_DIR"; return 1; }
+
+  # Secure permissions
+  chmod -v 600 "$CERT_DIR"/*.pem "$CERT_DIR"/*.key
+
+  return 0
+}
+
+
+[[ -f "$DOMAINS_FILE" ]] || { log "ERROR: Domains file not found: $DOMAINS_FILE"; exit 1; }
+
+while IFS= read -r line; do
+  # Trim whitespace & skip comments/blank lines
+  domain="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$line")"
+  [[ -z "$domain" || "$domain" =~ ^# ]] && continue
+
+  log "Processing $domain"
+
+  if [[ "$ENFORCE_ALIAS" == "1" ]]; then
+    if ! alias_cname_ok "$domain"; then
+      log "SKIP: Alias CNAME missing or wrong for $domain (want _acme-challenge.${CHALLENGE_ALIAS})."
+      continue
+    fi
+  fi
+
+  if ! ip_matches "$domain"; then
+    log "SKIP: $domain does not resolve to one of EXPECTED_IPS: $EXPECTED_IPS"
+    continue
+  fi
+
+  if issue_pair "$domain"; then
+    log "OK: Issued ECDSA+RSA for $domain"
+  else
+    log "ERROR: Issuance failed for $domain"
+  fi
+
+  sleep "$SLEEP_JITTER"
+done < "$DOMAINS_FILE"
+
+log "Done."

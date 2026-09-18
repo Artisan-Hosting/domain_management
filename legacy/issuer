@@ -1,0 +1,135 @@
+#!/bin/bash
+
+set -Eeuo pipefail
+
+log() { printf '%s [issuer] %s\n' "$(date -Is)" "$*"; }
+
+# ---- Config ---------------------------------------------------------------
+BUCKET_URI="${BUCKET_URI:-gs://certificate_bucket_1/nginx}"   # set yours
+SOURCE_TREE="${SOURCE_TREE:-/mnt/nginx_local}"
+CERT_ISSUER_SCRIPT="${CERT_ISSUER_SCRIPT:-/usr/local/bin/certs}"
+
+WORK_ROOT="${WORK_ROOT:-/opt/nginx-publisher}"
+KEEP_STAGE="${KEEP_STAGE:-0}"
+
+DO_ISSUE_CERTS="${DO_ISSUE_CERTS:-1}"
+DO_PUBLISH="${DO_PUBLISH:-1}"
+# --------------------------------------------------------------------------
+
+require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 2; }; }
+
+#require_cmd nginx
+require_cmd rsync
+require_cmd python3
+
+if [[ ! -d "$SOURCE_TREE" ]]; then echo "SOURCE_TREE missing: $SOURCE_TREE" >&2; exit 2; fi
+if [[ ! -f "$CERT_ISSUER_SCRIPT" ]]; then echo "CERT_ISSUER_SCRIPT missing: $CERT_ISSUER_SCRIPT" >&2; exit 2; fi
+
+# Prefer gcloud storage if available
+HAS_GCLOUD=0
+if command -v gcloud >/dev/null 2>&1; then
+  if gcloud storage --help >/dev/null 2>&1; then
+    HAS_GCLOUD=1
+  fi
+fi
+
+if [[ "$DO_PUBLISH" == "1" && "$HAS_GCLOUD" != "1" ]]; then
+  echo "Publishing requested but 'gcloud storage' is not available." >&2
+  echo "Install Google Cloud CLI, or provide a working Google gsutil." >&2
+  exit 2
+fi
+
+RELEASE_ID="$(date -u +'%Y-%m-%dT%H-%M-%SZ')"
+STAGE_DIR="$WORK_ROOT/stage/$RELEASE_ID"
+STAGE_TREE="$STAGE_DIR/tree"
+MANIFEST="$STAGE_DIR/manifest.json"
+
+mkdir -p "$STAGE_TREE"
+
+log "Release id: $RELEASE_ID"
+log "Bucket: $BUCKET_URI"
+
+# 1) Run issuance (your script)
+if [[ "$DO_ISSUE_CERTS" == "1" ]]; then
+  log "Running cert issuer script: $CERT_ISSUER_SCRIPT"
+  bash "$CERT_ISSUER_SCRIPT"
+else
+  log "Skipping issuance (DO_ISSUE_CERTS=0)"
+fi
+
+# 2) Snapshot to staging
+log "Snapshotting $SOURCE_TREE -> $STAGE_TREE"
+rsync -a --delete "$SOURCE_TREE/" "$STAGE_TREE/"
+
+# 3) Test nginx config
+log "Testing nginx config (attempt A: nginx -t -p STAGE_TREE -c nginx.conf)"
+set +e
+/sbin/nginx -t -p "$STAGE_TREE" -c nginx.conf
+RC=$?
+set -e
+
+if [[ $RC -ne 0 ]]; then
+  log "Attempt A failed. Falling back to sandbox clone test."
+  SANDBOX="$STAGE_DIR/sandbox"
+  ETC_SANDBOX="$SANDBOX/etc/nginx"
+  mkdir -p "$ETC_SANDBOX"
+  rsync -a --delete "$STAGE_TREE/" "$ETC_SANDBOX/"
+  /sbin/nginx -t -c "$ETC_SANDBOX/nginx.conf"
+fi
+
+log "nginx config test: OK"
+
+# 4) Manifest
+log "Writing manifest: $MANIFEST"
+python3 - <<'PY' "$STAGE_TREE" "$RELEASE_ID" "$MANIFEST"
+import json, os, hashlib, sys, time, platform
+tree_dir, release_id, manifest_path = sys.argv[1:]
+files = []
+for root, _, fs in os.walk(tree_dir):
+    for f in fs:
+        p = os.path.join(root, f)
+        rel = os.path.relpath(p, tree_dir).replace("\\","/")
+        h = hashlib.sha256()
+        with open(p, "rb") as fp:
+            for chunk in iter(lambda: fp.read(1024*1024), b""):
+                h.update(chunk)
+        files.append({"path": rel, "sha256": h.hexdigest(), "bytes": os.path.getsize(p)})
+manifest = {
+    "release_id": release_id,
+    "created_unix": int(time.time()),
+    "platform": platform.platform(),
+    "file_count": len(files),
+    "files": sorted(files, key=lambda x: x["path"]),
+}
+with open(manifest_path, "w") as f:
+    json.dump(manifest, f, indent=2)
+PY
+
+# 5) Publish using gcloud storage
+if [[ "$DO_PUBLISH" == "1" ]]; then
+  RELEASE_URI="$BUCKET_URI/releases/$RELEASE_ID"
+
+  log "Uploading tree -> $RELEASE_URI/tree (gcloud storage rsync)"
+  gcloud storage rsync --recursive --delete-unmatched-destination-objects \
+    "$STAGE_TREE" "$RELEASE_URI/tree"
+
+  log "Uploading manifest -> $RELEASE_URI/manifest.json"
+  gcloud storage cp "$MANIFEST" "$RELEASE_URI/manifest.json"
+
+  log "Updating latest pointer -> $BUCKET_URI/latest"
+  printf "%s" "$RELEASE_ID" > "$STAGE_DIR/latest"
+  gcloud storage cp "$STAGE_DIR/latest" "$BUCKET_URI/latest"
+
+  log "Publish complete: $RELEASE_ID"
+else
+  log "Skipping publish (DO_PUBLISH=0). Local stage at: $STAGE_DIR"
+fi
+
+# 6) Cleanup
+if [[ "$KEEP_STAGE" == "1" ]]; then
+  log "Keeping staged directory: $STAGE_DIR"
+else
+  rm -rf "$STAGE_DIR"
+fi
+
+log "Done."
