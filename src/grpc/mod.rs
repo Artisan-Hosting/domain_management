@@ -8,6 +8,7 @@ pub mod service;
 
 use artisan_middleware::dusa_collection_utils::core::logger::LogLevel;
 use artisan_middleware::dusa_collection_utils::log;
+use artisan_middleware::mtls::{MtlsConfig, load_mtls_material};
 use sqlx::MySqlPool;
 use std::net::SocketAddr;
 use tonic::transport::Server;
@@ -24,10 +25,34 @@ pub async fn serve(config: Config, secrets: Secrets, pool: MySqlPool) -> Result<
         .parse()
         .map_err(|e| Error::Config(format!("grpc.bind {:?}: {e}", config.grpc.bind)))?;
 
+    // Load mTLS material from environment variables with defaults
+    let mtls_cert_path = std::env::var("MTLS_CERT_PATH").unwrap_or_else(|_| "/etc/artisan/tls/domain_management.crt".into());
+    let mtls_key_path = std::env::var("MTLS_KEY_PATH").unwrap_or_else(|_| "/etc/artisan/tls/domain_management.key".into());
+    let mtls_ca_path = std::env::var("MTLS_CA_PATH").unwrap_or_else(|_| "/etc/artisan/tls/ca.crt".into());
+
+    let mtls_config = MtlsConfig {
+        cert_path: std::path::PathBuf::from(mtls_cert_path),
+        key_path: std::path::PathBuf::from(mtls_key_path),
+        ca_cert_path: std::path::PathBuf::from(mtls_ca_path),
+    };
+
+    let mtls_material = load_mtls_material(&mtls_config)
+        .map_err(|e| Error::Config(format!("failed to load mTLS material: {e}")))?;
+
+    let identity = tonic::transport::Identity::from_pem(&mtls_material.cert_pem, &mtls_material.key_pem);
+    let ca_cert = tonic::transport::Certificate::from_pem(&mtls_material.ca_pem);
+    let tls_config = tonic::transport::ServerTlsConfig::new()
+        .identity(identity)
+        .client_ca_root(ca_cert);
+
     let reflection_enabled = config.grpc.reflection;
     let service = service::Domains::new(config, secrets, pool)?;
 
-    let mut router = Server::builder().add_service(DomainServiceServer::new(service));
+    let mut builder = Server::builder()
+        .tls_config(tls_config)
+        .map_err(|e| Error::Config(format!("failed to configure TLS: {e}")))?;
+
+    let mut router = builder.add_service(DomainServiceServer::new(service));
 
     if reflection_enabled {
         let reflection = tonic_reflection::server::Builder::configure()
