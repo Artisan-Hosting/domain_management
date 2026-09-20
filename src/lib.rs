@@ -19,6 +19,7 @@ pub mod dns;
 pub mod error;
 pub mod grpc;
 pub mod inventory;
+pub mod mtls_client;
 pub mod proto;
 pub mod publish;
 pub mod vhost;

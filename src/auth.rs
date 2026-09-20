@@ -57,14 +57,29 @@ impl AuthClient {
     /// channel is built without touching the network, so constructing a
     /// client in a CLI that may never call ais_auth costs nothing.
     ///
+    /// The address scheme picks the transport. ais_auth requires mutual TLS, so
+    /// an `https://` address presents this service's client certificate
+    /// (`MTLS_CERT_PATH` / `MTLS_KEY_PATH` / `MTLS_CA_PATH`, defaulting to
+    /// `/etc/artisan/tls/domain_management.{crt,key}` and `ca.crt`) and checks
+    /// ais_auth's certificate against the name `ais_auth` (override with
+    /// `AUTH_TLS_SERVER_NAME`) -- the name it was issued for, not the address
+    /// we dial it by. `http://` is plaintext and won't reach a real ais_auth.
+    ///
     /// Must be called from inside a Tokio runtime -- `connect_lazy` registers
     /// with the reactor even though it dials nothing, and panics outside one.
     /// Every call site here is already async, but it is worth knowing before
     /// someone reaches for this from `main` before the runtime starts.
     pub fn new(addr: &str) -> Result<Self> {
-        let channel = Channel::from_shared(addr.to_owned())
-            .map_err(|e| Error::Config(format!("auth.grpc_addr {addr:?}: {e}")))?
-            .connect_lazy();
+        let config_err = |detail: String| Error::Config(format!("auth.grpc_addr {addr:?}: {detail}"));
+
+        let mtls = if crate::mtls_client::wants_tls(addr) {
+            Some(crate::mtls_client::ClientMtls::load("domain_management").map_err(config_err)?)
+        } else {
+            None
+        };
+        let server_name = std::env::var("AUTH_TLS_SERVER_NAME").unwrap_or_else(|_| "ais_auth".to_owned());
+        let channel = crate::mtls_client::internal_channel(addr, &server_name, mtls.as_ref())
+            .map_err(config_err)?;
 
         Ok(Self { channel })
     }

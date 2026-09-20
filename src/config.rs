@@ -53,8 +53,9 @@ pub struct Grpc {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Auth {
-    /// ais_auth's `AccountInternal` gRPC address. Portal defaults to
-    /// `http://10.2.0.2:50051` for the same service.
+    /// ais_auth's `AccountInternal` gRPC address. `https://` is mutual TLS (the
+    /// only thing a real ais_auth accepts); `http://` is plaintext. Portal
+    /// defaults to `https://10.2.0.2:50051` for the same service.
     pub grpc_addr: String,
     /// How long a validated token stays cached before it is re-checked.
     pub token_cache_secs: u64,
@@ -210,7 +211,7 @@ impl Default for Grpc {
 
 impl Default for Auth {
     fn default() -> Self {
-        Self { grpc_addr: "http://10.2.0.2:50051".to_owned(), token_cache_secs: 60 }
+        Self { grpc_addr: "https://10.2.0.2:50051".to_owned(), token_cache_secs: 60 }
     }
 }
 
