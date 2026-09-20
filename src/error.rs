@@ -46,6 +46,13 @@ pub enum Error {
     #[error("unauthenticated: {0}")]
     Unauthenticated(String),
 
+    /// A service this one depends on (ais_auth) could not be reached. Kept
+    /// distinct from `Invalid` so a caller can tell "the policy engine is
+    /// down, retry" from "you sent nonsense" -- a denial and an outage must
+    /// never look the same.
+    #[error("unavailable: {0}")]
+    Unavailable(String),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -56,6 +63,7 @@ impl From<Error> for tonic::Status {
     fn from(err: Error) -> Self {
         match err {
             Error::Unauthenticated(msg) => tonic::Status::unauthenticated(msg),
+            Error::Unavailable(msg) => tonic::Status::unavailable(msg),
             Error::Forbidden(msg) => tonic::Status::permission_denied(msg),
             Error::Invalid(msg) => tonic::Status::invalid_argument(msg),
             Error::NotFound(what) => tonic::Status::not_found(format!("{what} not found")),

@@ -46,6 +46,12 @@ service AccountInternal {
   rpc AssignRunnerOrg(AssignRunnerOrgRequest) returns (AssignRunnerOrgResponse);
   rpc RemoveRunnerFromOrg(RemoveRunnerFromOrgRequest) returns (RemoveRunnerFromOrgResponse);
   rpc ListRunnersInOrg(ListRunnersInOrgRequest) returns (ListRunnersInOrgResponse);
+
+  // RBAC Phase 1's generic resource_type x action decision. This service asks
+  // it about the runner a domain is attached to (a Project, which ais_auth can
+  // resolve to an organization) and about explicit Domain grants. Same message
+  // and field numbers as ais_auth's canonical copy in ../ais_proto.
+  rpc EvaluateAccess(EvaluateAccessRequest) returns (PermissionResponse);
 }
 
 message LoginRequest { string email = 1; string password = 2; }
@@ -102,3 +108,5 @@ message RemoveRunnerFromOrgResponse { bool success = 1; }
 
 message ListRunnersInOrgRequest { string access_token = 1; string organization_id = 2; }
 message ListRunnersInOrgResponse { repeated string runner_names = 1; }
+
+message EvaluateAccessRequest { map<string,string> claims = 1; string resource_type = 2; string resource_id = 3; string action = 4; }

@@ -12,7 +12,11 @@
   "auth": {
     // ais_auth's AccountInternal service -- the same address Portal uses.
     // Organizations and runners are read from here and nowhere else.
-    "grpc_addr": "http://10.2.0.2:50051",
+    //
+    // The scheme picks the transport, and ais_auth requires mutual TLS: keep
+    // `https://` unless you are pointed at a local plaintext dev server. A
+    // real ais_auth will not answer `http://`.
+    "grpc_addr": "https://10.2.0.2:50051",
     "token_cache_secs": 60
   },
 

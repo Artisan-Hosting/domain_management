@@ -23,11 +23,12 @@ use crate::error::{Error, Result};
 use crate::inventory::plan::{Catalog, OrgEntry, RunnerEntry};
 use crate::proto::accounts::account_internal_client::AccountInternalClient;
 use crate::proto::accounts::{
-    AssignRunnerOrgRequest, ElevateRequest, ListOrganizationsRequest, ListRunnersInOrgRequest,
-    LoginRequest, PermissionRequest, TokenRequest,
+    AssignRunnerOrgRequest, ElevateRequest, EvaluateAccessRequest, ListOrganizationsRequest,
+    ListRunnersInOrgRequest, LoginRequest, PermissionRequest, TokenRequest,
 };
 use artisan_middleware::api::claims::Claims;
 use artisan_middleware::api::roles::Role;
+use artisan_middleware::identity::{Action, ResourceType};
 
 #[derive(Clone)]
 pub struct AuthClient {
@@ -214,6 +215,42 @@ impl AuthClient {
         Ok(response.yes)
     }
 
+    /// The generic RBAC decision: may this caller perform `action` on this
+    /// resource? Asked of ais_auth rather than worked out here, because it owns
+    /// the org policy table and the grant table.
+    ///
+    /// Only ask about resources ais_auth can actually resolve. A `Project` (a
+    /// runner) resolves through its own `runners` table; a `Domain` does not
+    /// resolve at all -- that row lives in *this* service's database, and
+    /// ais_auth calling back here would close a loop -- so a `Domain` question
+    /// is answered by the grant tier alone and is `false` unless someone wrote
+    /// an explicit grant. See `grpc::authz` for how the two are combined.
+    ///
+    /// A failure to reach ais_auth is an error, never a `false`: the caller
+    /// turns it into `Unavailable` so a denial can never be confused with the
+    /// policy engine being down.
+    pub async fn evaluate_access(
+        &self,
+        claims: &Claims,
+        resource_type: ResourceType,
+        resource_id: &str,
+        action: Action,
+    ) -> Result<bool> {
+        let response = self
+            .client()
+            .evaluate_access(EvaluateAccessRequest {
+                claims: claims.to_map(),
+                resource_type: resource_type.as_str().to_owned(),
+                resource_id: resource_id.to_owned(),
+                action: action.as_str().to_owned(),
+            })
+            .await
+            .map_err(status_to_error)?
+            .into_inner();
+
+        Ok(response.yes)
+    }
+
     /// Every organization, and the runners in each.
     ///
     /// Reads only. A failure to reach ais_auth is reported by the caller and
@@ -343,7 +380,7 @@ fn status_to_error(status: tonic::Status) -> Error {
         tonic::Code::PermissionDenied => Error::Forbidden(status.message().to_owned()),
         tonic::Code::InvalidArgument => Error::Invalid(status.message().to_owned()),
         tonic::Code::Unavailable => {
-            Error::Invalid(format!("ais_auth is unreachable: {}", status.message()))
+            Error::Unavailable(format!("ais_auth is unreachable: {}", status.message()))
         }
         _ => Error::Invalid(format!("ais_auth: {status}")),
     }

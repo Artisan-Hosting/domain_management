@@ -4,6 +4,7 @@
 //! platform's single public entry point and forwards everything here, the
 //! same shape ais_auth and ais_secretserver already have.
 
+pub mod authz;
 pub mod service;
 
 use artisan_middleware::dusa_collection_utils::core::logger::LogLevel;
