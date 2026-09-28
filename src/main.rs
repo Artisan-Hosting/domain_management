@@ -152,6 +152,13 @@ enum PlanCommand {
 
 #[tokio::main]
 async fn main() {
+    // The dependency tree pulls in both rustls crypto backends (tonic/sqlx
+    // want ring, reqwest/rcgen/aws-sdk-s3 want aws-lc-rs), so rustls can't
+    // auto-pick a process-wide default and panics on first use without this.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("failed to install rustls CryptoProvider");
+
     set_log_level(LogLevel::Info);
 
     let cli = Cli::parse();
