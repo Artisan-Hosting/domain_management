@@ -61,7 +61,7 @@ impl AuthClient {
     /// The address scheme picks the transport. ais_auth requires mutual TLS, so
     /// an `https://` address presents this service's client certificate
     /// (`MTLS_CERT_PATH` / `MTLS_KEY_PATH` / `MTLS_CA_PATH`, defaulting to
-    /// `/etc/artisan/tls/domain_management.{crt,key}` and `ca.crt`) and checks
+    /// `/etc/artisan/tls/ais_domain.{crt,key}` and `ca.crt`) and checks
     /// ais_auth's certificate against the name `ais_auth` (override with
     /// `AUTH_TLS_SERVER_NAME`) -- the name it was issued for, not the address
     /// we dial it by. `http://` is plaintext and won't reach a real ais_auth.
@@ -74,7 +74,7 @@ impl AuthClient {
         let config_err = |detail: String| Error::Config(format!("auth.grpc_addr {addr:?}: {detail}"));
 
         let mtls = if crate::mtls_client::wants_tls(addr) {
-            Some(crate::mtls_client::ClientMtls::load("domain_management").map_err(config_err)?)
+            Some(crate::mtls_client::ClientMtls::load("ais_domain").map_err(config_err)?)
         } else {
             None
         };

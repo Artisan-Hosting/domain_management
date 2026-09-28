@@ -27,8 +27,8 @@ pub async fn serve(config: Config, secrets: Secrets, pool: MySqlPool) -> Result<
         .map_err(|e| Error::Config(format!("grpc.bind {:?}: {e}", config.grpc.bind)))?;
 
     // Load mTLS material from environment variables with defaults
-    let mtls_cert_path = std::env::var("MTLS_CERT_PATH").unwrap_or_else(|_| "/etc/artisan/tls/domain_management.crt".into());
-    let mtls_key_path = std::env::var("MTLS_KEY_PATH").unwrap_or_else(|_| "/etc/artisan/tls/domain_management.key".into());
+    let mtls_cert_path = std::env::var("MTLS_CERT_PATH").unwrap_or_else(|_| "/etc/artisan/tls/ais_domain.crt".into());
+    let mtls_key_path = std::env::var("MTLS_KEY_PATH").unwrap_or_else(|_| "/etc/artisan/tls/ais_domain.key".into());
     let mtls_ca_path = std::env::var("MTLS_CA_PATH").unwrap_or_else(|_| "/etc/artisan/tls/ca.crt".into());
 
     let mtls_config = MtlsConfig {
