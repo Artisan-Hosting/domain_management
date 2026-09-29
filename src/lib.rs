@@ -18,6 +18,7 @@ pub mod db;
 pub mod dns;
 pub mod error;
 pub mod grpc;
+pub mod intake;
 pub mod inventory;
 pub mod mtls_client;
 pub mod proto;

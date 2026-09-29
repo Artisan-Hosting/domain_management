@@ -18,6 +18,8 @@ pub struct InventoryRow {
     pub source: String,
     pub status: String,
     pub expires_at: Option<i64>,
+    /// The domain whose certificate covers this host, when it is one.
+    pub parent_fqdn: Option<String>,
     pub vhost_paths: Vec<String>,
     pub cert_dirs: Vec<String>,
     pub findings: Vec<String>,
@@ -61,7 +63,8 @@ pub async fn list_inventory(
     offset: i64,
 ) -> Result<Vec<InventoryRow>> {
     let mut builder = QueryBuilder::new(
-        "SELECT id, fqdn, organization_id, runner_id, source, status, UNIX_TIMESTAMP(expires_at) AS expires_at \
+        "SELECT id, fqdn, organization_id, runner_id, source, status, UNIX_TIMESTAMP(expires_at) AS expires_at, \
+         (SELECT p.fqdn FROM domains p WHERE p.id = domains.parent_id) AS parent_fqdn \
          FROM domains WHERE status <> 'removed'",
     );
 
@@ -90,6 +93,7 @@ pub async fn list_inventory(
             source: row.get("source"),
             status: row.get("status"),
             expires_at: row.get("expires_at"),
+            parent_fqdn: row.get("parent_fqdn"),
             vhost_paths: Vec::new(),
             cert_dirs: Vec::new(),
             findings: Vec::new(),
@@ -191,7 +195,8 @@ pub async fn inventory_counts(pool: &MySqlPool, organization_id: Option<&str>) -
 /// Looks a domain up by id or name, so callers can use whichever they have.
 pub async fn find_domain(pool: &MySqlPool, id_or_fqdn: &str) -> Result<Option<InventoryRow>> {
     let row = sqlx::query(
-        "SELECT id, fqdn, organization_id, runner_id, source, status, UNIX_TIMESTAMP(expires_at) AS expires_at \
+        "SELECT id, fqdn, organization_id, runner_id, source, status, UNIX_TIMESTAMP(expires_at) AS expires_at, \
+         (SELECT p.fqdn FROM domains p WHERE p.id = domains.parent_id) AS parent_fqdn \
          FROM domains WHERE fqdn = ? OR id = ? LIMIT 1",
     )
     .bind(id_or_fqdn)
@@ -207,10 +212,71 @@ pub async fn find_domain(pool: &MySqlPool, id_or_fqdn: &str) -> Result<Option<In
         source: row.get("source"),
         status: row.get("status"),
         expires_at: row.get("expires_at"),
+        parent_fqdn: row.get("parent_fqdn"),
         vhost_paths: Vec::new(),
         cert_dirs: Vec::new(),
         findings: Vec::new(),
     }))
+}
+
+/// The closest already-recorded domain above `fqdn`, nearest first.
+///
+/// `ancestors` comes from [`crate::intake::ancestors`], so it never climbs
+/// past the registrable domain into a public suffix.
+pub async fn nearest_ancestor(pool: &MySqlPool, ancestors: &[String]) -> Result<Option<InventoryRow>> {
+    for candidate in ancestors {
+        if let Some(row) = find_domain(pool, candidate).await? {
+            if row.status != "removed" {
+                return Ok(Some(row));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Whether we hold any certificate for this domain -- the difference between
+/// a host that is served the moment its DNS lands and one that still needs
+/// issuing.
+pub async fn has_certificate(pool: &MySqlPool, domain_id: u64) -> Result<bool> {
+    let row = sqlx::query("SELECT COUNT(*) AS n FROM certificates WHERE domain_id = ?")
+        .bind(domain_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.get::<i64, _>("n") > 0)
+}
+
+#[derive(Debug, Clone)]
+pub struct NewDomain<'a> {
+    pub fqdn: &'a str,
+    pub organization_id: Option<&'a str>,
+    pub runner_id: Option<&'a str>,
+    /// `byo` for anything added through the API; `imported` is the scanner's.
+    pub source: &'a str,
+    pub status: &'a str,
+    pub challenge_target: &'a str,
+    pub cf_zone_id: Option<&'a str>,
+    pub parent_id: Option<u64>,
+    pub created_by: Option<&'a str>,
+}
+
+pub async fn insert_domain(pool: &MySqlPool, new: &NewDomain<'_>) -> Result<u64> {
+    let result = sqlx::query(
+        "INSERT INTO domains (fqdn, organization_id, runner_id, source, status, challenge_target, \
+         cf_zone_id, parent_id, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(new.fqdn)
+    .bind(new.organization_id)
+    .bind(new.runner_id)
+    .bind(new.source)
+    .bind(new.status)
+    .bind(new.challenge_target)
+    .bind(new.cf_zone_id)
+    .bind(new.parent_id)
+    .bind(new.created_by)
+    .execute(pool)
+    .await?;
+
+    Ok(result.last_insert_id())
 }
 
 /// Writes an attachment. `None` leaves a field as it is; `Some(None)` clears
