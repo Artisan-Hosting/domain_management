@@ -57,6 +57,44 @@ that are not ours to discard.
 something is broken at 3am, finding out what is on disk, or issuing one
 certificate, should not depend on MySQL being up.
 
+## Subdomains
+
+A hostname under a domain we already hold -- `staging.artisanhosting.net`
+under `artisanhosting.net` -- is a site of its own, usually with its own
+runner and sometimes its own organization, but it is served from the parent's
+wildcard certificate and renewed with it.
+
+**The scanner gives every such host its own record**, with a `parent` link.
+(Before, it was folded into the parent as one more name, which is why the apex
+could be assigned to an organization and a runner while its staging site never
+appeared.) A host inherits the parent's certificate directories and expiry,
+and is exempt from the renewal findings -- it has no certificate of its own.
+A vhost file belongs to exactly one record, because `vhosts.source_path` is
+unique: when a file serves an apex and a subdomain, the apex keeps it.
+
+**`AddDomain` takes a name and works out what it means:**
+
+| The name is... | Outcome | What happens |
+|---|---|---|
+| already recorded | `LINKED` | Nothing changes. The vhost is written if instances were given. |
+| served by the edge's configs but not recorded | `ADOPTED` | Recorded via the same path as `apply`; the vhost is left as written. Non-Super callers need to own the parent. |
+| new, under a domain the caller owns | `PROVISIONED` | DNS is written through Cloudflare if we hold the zone; the vhost too, if instances were given. Covered by the parent's certificate, so nothing is issued. |
+| anything else | `NEEDS_DNS` | Recorded as `pending_dns`; the response lists the records to create. |
+
+If Cloudflare is not configured, the zone is not ours, or the write fails, a
+subdomain also falls back to `NEEDS_DNS` -- the name is still recorded, and
+`notes` in the response says why.
+
+DNS is **create-only**. If the name already has a record pointing somewhere
+else, nothing is written and the conflict is reported: the name may already be
+in use for a reason we cannot see, and repointing it would take that site
+down. Records are created DNS-only (not proxied), since the edge terminates TLS
+with our certificates.
+
+A tenant can add `staging.theirs.com` but not `x.someone-else.com`: the check
+is `may_write_domain` on the *parent*. A subdomain of a domain that exists on
+the edge but was never assigned to anyone is refused for everyone but Super.
+
 ## Adopting what is already there
 
 The system this replaces was loosely defined -- a flat `domains.txt`,
