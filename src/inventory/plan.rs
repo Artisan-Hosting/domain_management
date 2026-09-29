@@ -100,6 +100,10 @@ pub enum Confidence {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanDomain {
     pub fqdn: String,
+    /// The domain this hostname is issued under (`staging.example.com` under
+    /// `example.com`). Recorded so the two stay linked in the database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
     /// How this domain came to exist for us. Everything a scan finds is
     /// `imported` by definition.
     pub source: String,
@@ -244,7 +248,33 @@ pub fn from_inventory(inventory: &Inventory, catalog: Catalog) -> Plan {
     let mut domains = Vec::with_capacity(inventory.domains.len());
 
     for record in &inventory.domains {
-        let suggestion = suggest(record, &catalog);
+        let mut suggestion = suggest(record, &catalog);
+
+        // A host with no signal of its own falls back to its parent's
+        // organization -- weaker than a runner id or repo name, and marked so.
+        // Only when the parent's own suggestion is real: the "only one org
+        // exists" guess is already low-confidence and is not worth repeating.
+        if suggestion.as_ref().is_none_or(|s| s.confidence == Confidence::Low) {
+            let inherited = record
+                .parent
+                .as_ref()
+                .and_then(|parent| inventory.domains.iter().find(|d| &d.fqdn == parent))
+                .and_then(|parent| suggest(parent, &catalog))
+                .filter(|s| s.confidence != Confidence::Low && s.organization_id.is_some());
+            if let Some(parent_suggestion) = inherited {
+                suggestion = Some(Suggestion {
+                    organization_id: parent_suggestion.organization_id,
+                    // The runner belongs to the parent's site, not this one.
+                    runner_id: None,
+                    confidence: Confidence::Low,
+                    why: format!(
+                        "subdomain of {}: {}",
+                        record.parent.as_deref().unwrap_or_default(),
+                        parent_suggestion.why
+                    ),
+                });
+            }
+        }
 
         // The assignment starts as the suggestion: accepting the scanner's
         // guess should be "change nothing", and disagreeing should be the
@@ -285,6 +315,7 @@ pub fn from_inventory(inventory: &Inventory, catalog: Catalog) -> Plan {
 
         domains.push(PlanDomain {
             fqdn: record.fqdn.clone(),
+            parent: record.parent.clone(),
             source: "imported".to_owned(),
             found_in: record.found_in.iter().cloned().collect(),
             suggested: suggestion,
@@ -423,6 +454,7 @@ mod tests {
             in_domains_txt: true,
             expires_at: None,
             cloudflare_zone_id: None,
+            parent: None,
             findings: Vec::new(),
         }
     }
@@ -507,6 +539,7 @@ mod tests {
             catalog: catalog(),
             domains: vec![PlanDomain {
                 fqdn: "example.com".to_owned(),
+                parent: None,
                 source: "imported".to_owned(),
                 found_in: vec!["domains.txt".to_owned()],
                 suggested: None,

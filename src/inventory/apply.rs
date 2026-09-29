@@ -251,6 +251,17 @@ pub async fn apply(
         }
     }
 
+    // Parents are linked once everything exists: `api.example.com` sorts
+    // before `example.com`, so the parent row may not have been there yet
+    // when its host was inserted.
+    if !options.dry_run {
+        for domain in plan.domains.iter().filter(|d| d.action == Action::Import) {
+            if let Some(parent) = &domain.parent {
+                link_parent(pool, &domain.fqdn, parent).await?;
+            }
+        }
+    }
+
     apply_runner_assignments(plan, auth, options, &mut report).await;
 
     Ok(report)
@@ -329,6 +340,21 @@ async fn fetch_domain(pool: &MySqlPool, fqdn: &str) -> Result<Option<ExistingDom
         runner_id: row.get("runner_id"),
         status: row.get("status"),
     }))
+}
+
+/// Points a host at its parent domain. A missing parent (skipped in the
+/// plan, or never found) leaves the host standalone rather than failing.
+async fn link_parent(pool: &MySqlPool, fqdn: &str, parent: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE domains child JOIN domains parent ON parent.fqdn = ? \
+         SET child.parent_id = parent.id WHERE child.fqdn = ? AND child.id <> parent.id",
+    )
+    .bind(parent)
+    .bind(fqdn)
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
 
 async fn insert_domain(pool: &MySqlPool, desired: &DesiredDomain) -> Result<u64> {
@@ -570,6 +596,7 @@ mod tests {
     fn adopted_status_describes_what_is_already_true() {
         let with_both = PlanDomain {
             fqdn: "example.com".to_owned(),
+            parent: None,
             source: "imported".to_owned(),
             found_in: Vec::new(),
             suggested: None,

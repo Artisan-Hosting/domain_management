@@ -404,3 +404,121 @@ fn the_plan_round_trips_and_keeps_its_shape() {
     assert!(value["catalog"].is_object());
     assert_eq!(value["schema_version"], plan::SCHEMA_VERSION);
 }
+
+// --- subdomains --------------------------------------------------------
+//
+// `staging.artisanhosting.net` is covered by the apex's `*.` certificate, so
+// it used to be folded into the apex record as a name and never appeared as a
+// domain in its own right: `artisanhosting.net` could be assigned to an
+// organization and a runner, while its staging site could not be listed at all.
+
+#[test]
+fn a_subdomain_under_a_known_zone_is_its_own_record() {
+    let fixture = fixture("subdomain");
+    let tree = &fixture.config.tree.root;
+
+    write(
+        &tree.join("sites-enabled/artisanhosting_staging_site"),
+        "server {\n    listen 443 ssl http2;\n    server_name staging.artisanhosting.net;\n\
+         include snippets/artisanhosting_cert.conf;\n\
+         location / { proxy_pass http://ahpn-9999999999999999.ah.internal:8093; }\n}\n",
+    );
+    // A www of a host is that host, not a third site.
+    write(
+        &tree.join("sites-enabled/artisanhosting_staging_www"),
+        "server {\n    listen 443 ssl http2;\n    server_name www.staging.artisanhosting.net;\n\
+         include snippets/artisanhosting_cert.conf;\n\
+         location / { proxy_pass http://ahpn-9999999999999999.ah.internal:8093; }\n}\n",
+    );
+
+    let inventory = scan(&fixture);
+
+    let staging = inventory
+        .domains
+        .iter()
+        .find(|d| d.fqdn == "staging.artisanhosting.net")
+        .expect("staging.artisanhosting.net must be listed on its own");
+    assert_eq!(staging.parent.as_deref(), Some("artisanhosting.net"));
+    assert!(staging.serves_tls);
+    assert!(staging.vhost_files.contains("sites-enabled/artisanhosting_staging_site"));
+    assert!(staging.upstreams.iter().any(|u| u.contains("9999999999999999")));
+
+    // Covered by, and renewed with, the parent's certificate.
+    assert!(staging.cert_dirs.contains("_.artisanhosting.net"));
+    assert_eq!(
+        staging.expires_at,
+        inventory.domains.iter().find(|d| d.fqdn == "artisanhosting.net").unwrap().expires_at
+    );
+
+    assert!(
+        !inventory.domains.iter().any(|d| d.fqdn == "www.staging.artisanhosting.net"),
+        "a www is the same site as its host"
+    );
+    assert!(staging.names.contains("www.staging.artisanhosting.net"));
+
+    // Renewal is the parent's business: the host must not be reported as
+    // "served but never renewed" when its parent's certificate covers it.
+    assert!(!staging.findings.contains(&FindingCode::VhostOnly));
+
+    // And the apex keeps only what is its own.
+    let apex = inventory.domains.iter().find(|d| d.fqdn == "artisanhosting.net").unwrap();
+    assert_eq!(apex.parent, None);
+    assert!(!apex.vhost_files.contains("sites-enabled/artisanhosting_staging_site"));
+    assert!(!apex.names.contains("staging.artisanhosting.net"));
+    assert!(!apex.upstreams.iter().any(|u| u.contains("9999999999999999")));
+}
+
+#[test]
+fn a_file_serving_the_apex_and_a_subdomain_stays_with_the_apex() {
+    let fixture = fixture("subdomain_shared");
+    let tree = &fixture.config.tree.root;
+
+    write(
+        &tree.join("sites-enabled/artisanhosting_both"),
+        "server {\n    listen 443 ssl http2;\n    server_name staging.artisanhosting.net artisanhosting.net;\n\
+         include snippets/artisanhosting_cert.conf;\n\
+         location / { proxy_pass http://10.1.0.5:80; }\n}\n",
+    );
+
+    let inventory = scan(&fixture);
+    let staging = inventory.domains.iter().find(|d| d.fqdn == "staging.artisanhosting.net").unwrap();
+    let apex = inventory.domains.iter().find(|d| d.fqdn == "artisanhosting.net").unwrap();
+
+    // `vhosts.source_path` is unique, so a file can be attached to one
+    // domain. The apex wins it; the host still knows it was seen there.
+    assert!(apex.vhost_files.contains("sites-enabled/artisanhosting_both"));
+    assert!(!staging.vhost_files.contains("sites-enabled/artisanhosting_both"));
+    assert!(staging.found_in.contains("vhost:sites-enabled/artisanhosting_both"));
+}
+
+#[test]
+fn the_plan_carries_the_parent_link_and_a_weak_org_suggestion() {
+    let fixture = fixture("subdomain_plan");
+    let tree = &fixture.config.tree.root;
+    write(
+        &tree.join("sites-enabled/artisanhosting_staging_site"),
+        "server {\n    listen 443 ssl http2;\n    server_name staging.artisanhosting.net;\n\
+         include snippets/artisanhosting_cert.conf;\n\
+         location / { proxy_pass http://10.1.0.5:80; }\n}\n",
+    );
+
+    let inventory = scan(&fixture);
+    let catalog = plan::Catalog {
+        organizations: vec![plan::OrgEntry { organization_id: "org-a".to_owned(), name: "Artisan".to_owned() }],
+        runners: vec![plan::RunnerEntry {
+            runner_id: "2973453917896704".to_owned(),
+            repo: None,
+            branch: None,
+            organization_id: Some("org-a".to_owned()),
+        }],
+    };
+    let plan = plan::from_inventory(&inventory, catalog);
+
+    let staging = plan.domains.iter().find(|d| d.fqdn == "staging.artisanhosting.net").unwrap();
+    assert_eq!(staging.parent.as_deref(), Some("artisanhosting.net"));
+
+    let suggestion = staging.suggested.as_ref().expect("inherits the parent's organization");
+    assert_eq!(suggestion.organization_id.as_deref(), Some("org-a"));
+    assert_eq!(suggestion.confidence, plan::Confidence::Low);
+    assert_eq!(suggestion.runner_id, None, "the parent's runner is not this site's runner");
+}
