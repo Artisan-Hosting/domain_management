@@ -149,6 +149,13 @@ pub struct DomainRecord {
     /// domain, if any. Absent means "not checked" as much as "not there".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloudflare_zone_id: Option<String>,
+    /// Set when this is a hostname living under another record's certificate
+    /// (`staging.artisanhosting.net` under `artisanhosting.net`): the parent's
+    /// `fqdn`. Such a host is its own record so it can be assigned to its own
+    /// organization or runner, but it is issued and renewed as part of the
+    /// parent, which is why certificate facts are inherited from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
     pub findings: Vec<FindingCode>,
 }
 
@@ -240,6 +247,35 @@ pub fn build(
     // name -> the files claiming it, for duplicate detection.
     let mut claims: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
+    // Which record a vhost *file* belongs to. `vhosts.source_path` is unique,
+    // so a file can be recorded against one domain only; when a file serves
+    // several records the unit itself wins (it is the one whose certificate
+    // the file uses), then the first host by name.
+    let mut file_owner: BTreeMap<&str, (bool, String)> = BTreeMap::new();
+    for server in &nginx.servers {
+        for name in server.real_names() {
+            let bare = name.trim_start_matches("*.").to_ascii_lowercase();
+            if registrable_domain(&bare).is_none() {
+                continue;
+            }
+            let unit = issuance_unit(&bare, &units);
+            // `false` sorts first, so a unit beats any host.
+            let candidate = if host_parent(&bare, &unit).is_some() {
+                (true, bare)
+            } else {
+                (false, unit)
+            };
+            file_owner
+                .entry(server.file.as_str())
+                .and_modify(|current| {
+                    if candidate < *current {
+                        *current = candidate.clone();
+                    }
+                })
+                .or_insert(candidate);
+        }
+    }
+
     for server in &nginx.servers {
         for name in server.real_names() {
             let bare = name.trim_start_matches("*.").to_ascii_lowercase();
@@ -252,11 +288,24 @@ pub fn build(
                 continue;
             }
             let unit = issuance_unit(&bare, &units);
-            let record = domains.entry(unit.clone()).or_insert_with(|| empty_record(&unit));
+
+            // A real host under a known unit is a record of its own rather
+            // than a name on its parent's -- that folding is what made
+            // `staging.<zone>` invisible while `<zone>` looked fine.
+            let parent = host_parent(&bare, &unit).map(str::to_owned);
+            let key = if parent.is_some() { bare.clone() } else { unit.clone() };
+
+            let record = domains.entry(key.clone()).or_insert_with(|| {
+                let mut record = empty_record(&key);
+                record.parent = parent.clone();
+                record
+            });
 
             record.names.insert(bare.clone());
             record.found_in.insert(format!("vhost:{}", server.file));
-            record.vhost_files.insert(server.file.clone());
+            if file_owner.get(server.file.as_str()).is_some_and(|(_, owner)| *owner == key) {
+                record.vhost_files.insert(server.file.clone());
+            }
             record.upstreams.extend(server.proxy_passes.iter().cloned());
             record.serves_tls |= server.is_tls();
         }
@@ -473,8 +522,30 @@ pub fn build(
         });
     }
 
+    // --- hosts inherit their parent's certificate ------------------------
+    // A host is served from its parent's wildcard, so what covers and renews
+    // it is the parent's: the same certificate directories and expiry.
+    let parents: BTreeMap<String, (BTreeSet<String>, Option<i64>)> = domains
+        .values()
+        .filter(|record| record.parent.is_none())
+        .map(|record| (record.fqdn.clone(), (record.cert_dirs.clone(), record.expires_at)))
+        .collect();
+    for record in domains.values_mut() {
+        let Some((cert_dirs, expires_at)) = record.parent.as_ref().and_then(|p| parents.get(p)) else {
+            continue;
+        };
+        record.cert_dirs = cert_dirs.clone();
+        record.expires_at = *expires_at;
+    }
+
     // --- the two joins that matter most ---------------------------------
     for record in domains.values_mut() {
+        // Renewal is per certificate, and a host has none of its own: the
+        // parent's record says whether it is being renewed.
+        if record.parent.is_some() {
+            continue;
+        }
+
         if record.in_domains_txt && record.vhost_files.is_empty() && record.cert_dirs.is_empty() {
             findings.push(Finding {
                 code: FindingCode::DomainsTxtOnly,
@@ -503,10 +574,15 @@ pub fn build(
     // Attach findings to the domains they concern.
     for finding in &findings {
         if registrable_domain(&finding.subject).is_some() {
+            // The host itself if it has a record, and always its unit: a
+            // mismatch on `staging.` is also a fact about the certificate.
             let unit = issuance_unit(&finding.subject, &units);
-            if let Some(record) = domains.get_mut(&unit) {
-                if !record.findings.contains(&finding.code) {
-                    record.findings.push(finding.code);
+            let subject = finding.subject.to_ascii_lowercase();
+            for key in [&subject, &unit] {
+                if let Some(record) = domains.get_mut(key) {
+                    if !record.findings.contains(&finding.code) {
+                        record.findings.push(finding.code);
+                    }
                 }
             }
         }
@@ -542,7 +618,22 @@ fn empty_record(fqdn: &str) -> DomainRecord {
         in_domains_txt: false,
         expires_at: None,
         cloudflare_zone_id: None,
+        parent: None,
         findings: Vec::new(),
+    }
+}
+
+/// The parent unit when `name` is a real host under it, as opposed to the
+/// unit itself or its `www`.
+///
+/// `www.shop.example.com` belongs to `shop.example.com` and is the same site;
+/// `staging.example.com` under `example.com` is a different site that merely
+/// shares a certificate.
+pub fn host_parent<'a>(name: &str, unit: &'a str) -> Option<&'a str> {
+    if name == unit || name.strip_prefix("www.") == Some(unit) {
+        None
+    } else {
+        Some(unit)
     }
 }
 

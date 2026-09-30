@@ -240,3 +240,44 @@ async fn a_hand_written_vhost_survives_an_attach() {
     }
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 }
+
+#[tokio::test]
+async fn a_subdomain_is_served_from_its_parents_certificate() {
+    // The fixture issued a certificate for example.com only. staging.example.com
+    // has none of its own, and must not be turned away for that: it is covered
+    // by the parent's wildcard, so its vhost includes the parent's snippet.
+    let f = fixture("subdomain", true, true);
+
+    let mut spec = VhostSpec::new(
+        "staging.example.com",
+        "ab12cd34",
+        vec![Backend::Node { node_id: "node1".to_owned(), port: 8093 }],
+    );
+    spec.cert_zone = Some("example.com".to_owned());
+
+    let outcome = ais_domains::vhost::attach(&f.config, &spec).await.unwrap();
+    assert!(matches!(outcome.snippet, SnippetOutcome::Created(_)));
+
+    let vhost = std::fs::read_to_string(f.config.vhost_path_for("staging.example.com")).unwrap();
+    assert!(vhost.contains("server_name staging.example.com;"));
+    assert!(vhost.contains("include snippets/example_cert.conf;"), "{vhost}");
+    assert!(!vhost.contains("staging_example_cert"), "no snippet for a certificate that does not exist");
+
+    // The snippet is the zone's, one file shared by every host on it.
+    let snippet = std::fs::read_to_string(f.config.snippet_path_for("example.com")).unwrap();
+    assert!(snippet.contains("/etc/nginx/certs/_.example.com/ecc.pem"));
+    assert!(!f.config.snippet_path_for("staging.example.com").exists());
+}
+
+#[tokio::test]
+async fn without_a_cert_zone_a_subdomain_still_needs_its_own_certificate() {
+    let f = fixture("subdomain_own", true, true);
+    let spec = VhostSpec::new(
+        "staging.example.com",
+        "ab12cd34",
+        vec![Backend::Node { node_id: "node1".to_owned(), port: 8093 }],
+    );
+
+    let err = ais_domains::vhost::attach(&f.config, &spec).await.unwrap_err();
+    assert!(err.to_string().contains("no certificate yet"), "{err}");
+}
