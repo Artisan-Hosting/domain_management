@@ -298,6 +298,23 @@ pub async fn record_generated_vhost(
     Ok(())
 }
 
+/// The `origin` of the one vhost a domain has, if any -- `DetachDomain`'s
+/// guard against deleting a file it did not generate.
+pub async fn vhost_origin(pool: &MySqlPool, domain_id: u64) -> Result<Option<String>> {
+    let row = sqlx::query("SELECT origin FROM vhosts WHERE domain_id = ? LIMIT 1")
+        .bind(domain_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|row| row.get::<String, _>("origin")))
+}
+
+/// Drops the tracking row for a vhost this service generated. Never called
+/// for an `adopted` or freeform-tracked file -- see `vhost_origin`'s caller.
+pub async fn delete_vhost(pool: &MySqlPool, domain_id: u64) -> Result<()> {
+    sqlx::query("DELETE FROM vhosts WHERE domain_id = ?").bind(domain_id).execute(pool).await?;
+    Ok(())
+}
+
 pub async fn list_findings(
     pool: &MySqlPool,
     code: Option<&str>,

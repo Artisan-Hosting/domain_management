@@ -18,6 +18,15 @@
 //! only [`Secrets::cf_challenge_token`] is needed for routine certificate
 //! renewals -- that one is scoped to the alias zone alone, so a leak of the
 //! token used every hour cannot touch a customer's zone.
+//!
+//! [`Config`] and [`Secrets`] are the substrate all three subsystems load
+//! from (see the crate root doc): the CLI calls [`Config::load`]/
+//! [`Secrets::load`] fresh on every invocation, while the gRPC service
+//! loads them once in `main.rs::run` and holds them for the process's
+//! lifetime -- the future job worker is handed a *clone* of that same
+//! pair rather than reloading the files itself, so a config edit takes
+//! effect on the next restart for every subsystem at once, never for one
+//! and not the others.
 
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, path::{Path, PathBuf}};
@@ -32,6 +41,7 @@ pub const DEFAULT_ENV_PATH: &str = "/opt/artisan/etc/ais_domains.env";
 pub struct Config {
     pub grpc: Grpc,
     pub auth: Auth,
+    pub billing: Billing,
     pub acme: Acme,
     pub cloudflare: Cloudflare,
     pub dns: Dns,
@@ -59,6 +69,26 @@ pub struct Auth {
     pub grpc_addr: String,
     /// How long a validated token stays cached before it is re-checked.
     pub token_cache_secs: u64,
+}
+
+/// The `Billing` service's gRPC address -- the sole source of Stripe
+/// integration on this platform now, so this service never holds a Stripe
+/// key of its own. See `src/billing.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Billing {
+    /// `https://` is mutual TLS; `http://` is plaintext (local dev only,
+    /// against a Billing run without TLS). Defaults to plaintext localhost
+    /// -- safe to boot with, and obviously not a real deployment address,
+    /// the same "safe but must be configured for production" shape
+    /// `Purchasing::enabled`'s `false` default has.
+    pub grpc_addr: String,
+}
+
+impl Default for Billing {
+    fn default() -> Self {
+        Self { grpc_addr: "http://127.0.0.1:50061".to_owned() }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +222,7 @@ impl Default for Config {
         Self {
             grpc: Grpc::default(),
             auth: Auth::default(),
+            billing: Billing::default(),
             acme: Acme::default(),
             cloudflare: Cloudflare::default(),
             dns: Dns::default(),
@@ -428,9 +459,6 @@ pub struct Secrets {
     pub cf_members_token: String,
     pub r2_access_key_id: String,
     pub r2_secret_access_key: String,
-    pub stripe_secret_key: String,
-    pub stripe_webhook_secret: String,
-    pub stripe_publishable_key: String,
 }
 
 impl std::fmt::Debug for Secrets {
@@ -444,7 +472,9 @@ impl Secrets {
     /// Loads the env file (if present) and then the process environment,
     /// which wins. Missing values are empty rather than fatal: `ais_domains
     /// issue` needs the Cloudflare challenge token and nothing else, and
-    /// should not demand a Stripe key to run.
+    /// should not demand every other credential just to run. (Stripe
+    /// credentials live in the `Billing` service now, not here -- see
+    /// `src/billing.rs` and `Config::billing`.)
     pub fn load(env_path: Option<&Path>) -> Result<Self> {
         let path = env_path.unwrap_or_else(|| Path::new(DEFAULT_ENV_PATH));
         let file_vars = if path.exists() { parse_env_file(path)? } else { HashMap::new() };
@@ -467,9 +497,6 @@ impl Secrets {
             cf_members_token: get("CF_MEMBERS_TOKEN"),
             r2_access_key_id: get("R2_ACCESS_KEY_ID"),
             r2_secret_access_key: get("R2_SECRET_ACCESS_KEY"),
-            stripe_secret_key: get("STRIPE_SECRET_KEY"),
-            stripe_webhook_secret: get("STRIPE_WEBHOOK_SECRET"),
-            stripe_publishable_key: get("STRIPE_PUBLISHABLE_KEY"),
         })
     }
 
