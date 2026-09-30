@@ -140,6 +140,28 @@ pub fn may_write_domain(
     }
 }
 
+/// May this caller read this domain record?
+///
+/// The lighter, read-only counterpart to [`may_write_domain`]: an
+/// unassigned or other-org domain is refused exactly the same way (an fqdn
+/// being guessable must never be what decides visibility), but any role
+/// within the owning org may read, not just `Admin` -- there is no runner
+/// grant to check, since reading changes nothing on either end.
+pub fn may_read_domain(role: Role, caller_org: &str, domain_org: Option<&str>) -> Result<(), Denial> {
+    if role == Role::Super {
+        return Ok(());
+    }
+
+    let caller_org = real_org(caller_org).ok_or(Denial::NoOrg)?;
+
+    match domain_org.and_then(real_org) {
+        None => Err(Denial::Unassigned),
+        Some(owner) if owner != caller_org => Err(Denial::OtherOrg),
+        Some(_) => Ok(()),
+    }
+
+}
+
 /// May this caller add a *new* name at all?
 ///
 /// There is no record yet to check ownership against, so the bar is the role
@@ -310,6 +332,13 @@ mod tests {
     }
 
     #[test]
+    fn any_role_in_the_owning_org_may_read_a_domain() {
+        for role in [Role::Admin, Role::Controller, Role::Viewer, Role::Audit] {
+            assert!(may_read_domain(role, ORG_A, Some(ORG_A)).is_ok(), "{role:?}");
+        }
+    }
+
+    #[test]
     fn only_an_org_admin_or_super_may_add_a_name() {
         assert!(may_add_domain(Role::Super, "").is_ok(), "super needs no org");
         assert!(may_add_domain(Role::Admin, ORG_A).is_ok());
@@ -318,6 +347,22 @@ mod tests {
         for role in [Role::Controller, Role::Viewer, Role::Audit, Role::None] {
             assert_eq!(may_add_domain(role, ORG_A).unwrap_err(), Denial::NotPermitted, "{role:?}");
         }
+    }
+
+    #[test]
+    fn reading_another_orgs_domain_is_refused() {
+        assert_eq!(may_read_domain(Role::Admin, ORG_A, Some(ORG_B)), Err(Denial::OtherOrg));
+    }
+
+    #[test]
+    fn reading_an_unassigned_domain_is_refused_even_for_a_read() {
+        assert_eq!(may_read_domain(Role::Admin, ORG_A, None), Err(Denial::Unassigned));
+    }
+
+    #[test]
+    fn super_may_read_any_domain() {
+        assert!(may_read_domain(Role::Super, "", None).is_ok());
+        assert!(may_read_domain(Role::Super, ORG_A, Some(ORG_B)).is_ok());
     }
 
     #[test]

@@ -42,8 +42,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // editing Billing's copy.
     println!("cargo:rerun-if-changed=proto/billing.proto");
 
+    // Server stubs are built too, only so the integration tests can host a
+    // fake Billing; nothing in the service itself serves this API.
     tonic_prost_build::configure()
-        .build_server(false)
+        .build_server(true)
         .build_client(true)
         .compile_protos(&["proto/billing.proto"], &["proto"])?;
 

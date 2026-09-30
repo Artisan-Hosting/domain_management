@@ -102,9 +102,15 @@ pub async fn find_quote(pool: &MySqlPool, id: &str) -> Result<Option<QuoteRow>> 
     }))
 }
 
-/// Records a new order in `awaiting_payment`. Returns the new row's id.
+/// Records a new order in `awaiting_payment` **and** queues its `register`
+/// job, in one transaction: an order with no job would sit waiting for a
+/// payment nothing ever checks, and a job with no order is meaningless.
+/// Returns the new order's id.
+///
+/// A duplicate quote or a name already being bought fails on the unique
+/// keys from migration 0007; see [`is_duplicate`].
 #[allow(clippy::too_many_arguments)]
-pub async fn insert_order(
+pub async fn insert_order_with_job(
     pool: &MySqlPool,
     fqdn: &str,
     organization_id: &str,
@@ -116,6 +122,8 @@ pub async fn insert_order(
     runner_id: &str,
     invite_email: &str,
 ) -> Result<u64> {
+    let mut tx = pool.begin().await?;
+
     let result = sqlx::query(
         "INSERT INTO domain_orders \
          (fqdn, organization_id, user_id, quote_id, cost_cents, price_cents, currency, state, \
@@ -131,10 +139,73 @@ pub async fn insert_order(
     .bind(currency)
     .bind(none_if_empty(runner_id))
     .bind(none_if_empty(invite_email))
+    .execute(&mut *tx)
+    .await?;
+    let order_id = result.last_insert_id();
+
+    sqlx::query("INSERT INTO jobs (kind, order_id) VALUES ('register', ?)")
+        .bind(order_id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(order_id)
+}
+
+/// Whether `err` is MySQL's duplicate-key error (1062).
+pub fn is_duplicate(err: &crate::error::Error) -> bool {
+    match err {
+        crate::error::Error::Database(sqlx::Error::Database(db)) => db.code().as_deref() == Some("23000") && db.message().contains("Duplicate entry"),
+        _ => false,
+    }
+}
+
+pub async fn find_order_by_quote(pool: &MySqlPool, quote_id: &str) -> Result<Option<OrderRow>> {
+    let row = sqlx::query(&format!("{ORDER_SELECT} WHERE quote_id = ?")).bind(quote_id).fetch_optional(pool).await?;
+    Ok(row.map(row_to_order))
+}
+
+/// The order that currently holds `fqdn` (any state but failed/refunded), if any.
+pub async fn find_live_order_for_fqdn(pool: &MySqlPool, fqdn: &str) -> Result<Option<OrderRow>> {
+    let row = sqlx::query(&format!("{ORDER_SELECT} WHERE live_fqdn = ?")).bind(fqdn).fetch_optional(pool).await?;
+    Ok(row.map(row_to_order))
+}
+
+/// Written **before** the registrar is called. Once this is set the order is
+/// only ever polled, never registered again, so a crash between this write and
+/// the registrar call cannot lead to buying the name twice -- the worst case is
+/// an order an admin has to look at.
+pub async fn begin_registration(pool: &MySqlPool, order_id: u64) -> Result<()> {
+    sqlx::query("UPDATE domain_orders SET state = 'registering', cf_workflow_state = 'requested' WHERE id = ?")
+        .bind(order_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The customer has been refunded in full.
+pub async fn mark_refunded(pool: &MySqlPool, order_id: u64, refund_id: &str, reason: &str) -> Result<()> {
+    sqlx::query("UPDATE domain_orders SET state = 'refunded', stripe_refund_id = ?, last_error = ? WHERE id = ?")
+        .bind(refund_id)
+        .bind(reason)
+        .bind(order_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Hands an order to a human. Only moves an order that is still in flight, so
+/// it can never overwrite `completed`, `failed` or `refunded`.
+pub async fn mark_needs_admin(pool: &MySqlPool, order_id: u64, reason: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE domain_orders SET state = 'needs_admin', last_error = ? \
+         WHERE id = ? AND state IN ('awaiting_payment', 'paid', 'registering')",
+    )
+    .bind(reason)
+    .bind(order_id)
     .execute(pool)
     .await?;
-
-    Ok(result.last_insert_id())
+    Ok(())
 }
 
 pub async fn set_payment_intent(pool: &MySqlPool, order_id: u64, stripe_payment_intent_id: &str) -> Result<()> {

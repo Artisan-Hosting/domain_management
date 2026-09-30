@@ -251,7 +251,7 @@ async fn a_subdomain_is_served_from_its_parents_certificate() {
     let mut spec = VhostSpec::new(
         "staging.example.com",
         "ab12cd34",
-        vec![Backend { node_id: "node1".to_owned(), port: 8093 }],
+        vec![Backend::Node { node_id: "node1".to_owned(), port: 8093 }],
     );
     spec.cert_zone = Some("example.com".to_owned());
 
@@ -275,7 +275,7 @@ async fn without_a_cert_zone_a_subdomain_still_needs_its_own_certificate() {
     let spec = VhostSpec::new(
         "staging.example.com",
         "ab12cd34",
-        vec![Backend { node_id: "node1".to_owned(), port: 8093 }],
+        vec![Backend::Node { node_id: "node1".to_owned(), port: 8093 }],
     );
 
     let err = ais_domains::vhost::attach(&f.config, &spec).await.unwrap_err();
