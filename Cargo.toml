@@ -38,6 +38,7 @@ instant-acme = "0.8"
 rcgen = { version = "0.14", features = ["aws_lc_rs", "pem"] }
 hickory-resolver = "0.26"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "charset", "http2"] }
+rustls = "0.23"
 x509-parser = "0.18"
 uuid = { version = "1", features = ["v4"] }
 aws-sdk-s3 = "1"

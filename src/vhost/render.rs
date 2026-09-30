@@ -168,10 +168,11 @@ pub struct VhostSpec {
     pub backends: Vec<Backend>,
     /// Also emit the port-80 server that redirects to HTTPS.
     pub http_redirect: bool,
-    /// Extra `add_header` lines in `location /`.
-    pub extra_headers: Vec<HeaderEntry>,
-    pub cors: Option<CorsPolicy>,
-    pub extra_locations: Vec<ExtraLocation>,
+    /// The zone whose certificate this vhost serves, when it is not `fqdn`'s
+    /// own. `staging.example.com` is served from `example.com`'s wildcard, so
+    /// its vhost must include `example_cert.conf` rather than a snippet for a
+    /// certificate that was never issued.
+    pub cert_zone: Option<String>,
 }
 
 impl VhostSpec {
@@ -182,10 +183,13 @@ impl VhostSpec {
             runner_id: runner_id.to_owned(),
             backends,
             http_redirect: true,
-            extra_headers: Vec::new(),
-            cors: None,
-            extra_locations: Vec::new(),
+            cert_zone: None,
         }
+    }
+
+    /// The name whose certificate directory and snippet this vhost uses.
+    pub fn cert_zone(&self) -> &str {
+        self.cert_zone.as_deref().unwrap_or(&self.fqdn)
     }
 
     pub fn server_names(&self) -> Vec<String> {
@@ -262,7 +266,7 @@ pub fn render(config: &Config, spec: &VhostSpec) -> Result<String> {
 
     let upstream = spec.upstream_name();
     let snippets = &config.tree.snippets_dir;
-    let slug = snippet_slug(&spec.fqdn);
+    let slug = snippet_slug(spec.cert_zone());
     let names = spec.server_names().join(" ");
     let scheme = if spec.tls() { "https" } else { "http" };
 

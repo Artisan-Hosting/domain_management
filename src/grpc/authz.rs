@@ -140,25 +140,36 @@ pub fn may_write_domain(
     }
 }
 
-/// May this caller read this domain record?
+/// May this caller add a *new* name at all?
 ///
-/// The lighter, read-only counterpart to [`may_write_domain`]: an
-/// unassigned or other-org domain is refused exactly the same way (an fqdn
-/// being guessable must never be what decides visibility), but any role
-/// within the owning org may read, not just `Admin` -- there is no runner
-/// grant to check, since reading changes nothing on either end.
-pub fn may_read_domain(role: Role, caller_org: &str, domain_org: Option<&str>) -> Result<(), Denial> {
+/// There is no record yet to check ownership against, so the bar is the role
+/// and having an organization to put it in: an org `Admin`, or `Super`.
+pub fn may_add_domain(role: Role, caller_org: &str) -> Result<(), Denial> {
     if role == Role::Super {
         return Ok(());
     }
+    real_org(caller_org).ok_or(Denial::NoOrg)?;
+    if role == Role::Admin { Ok(()) } else { Err(Denial::NotPermitted) }
+}
 
-    let caller_org = real_org(caller_org).ok_or(Denial::NoOrg)?;
-
-    match domain_org.and_then(real_org) {
-        None => Err(Denial::Unassigned),
-        Some(owner) if owner != caller_org => Err(Denial::OtherOrg),
-        Some(_) => Ok(()),
+/// The organization a newly added name is stamped with.
+///
+/// Never taken from the request for anyone but `Super` -- an Admin naming
+/// someone else's organization would be adding a domain to a tenant that did
+/// not ask for it. `Super` may name one; failing that a subdomain follows its
+/// parent, and otherwise the name is left unassigned, which is a normal state.
+pub fn owner_for_new(
+    role: Role,
+    caller_org: &str,
+    requested: &str,
+    parent_org: Option<&str>,
+) -> Option<String> {
+    if role != Role::Super {
+        return real_org(caller_org).map(str::to_owned);
     }
+    real_org(requested)
+        .or_else(|| parent_org.and_then(real_org))
+        .map(str::to_owned)
 }
 
 /// Moving a name from one tenant to another, which costs a fresh password.
@@ -299,25 +310,26 @@ mod tests {
     }
 
     #[test]
-    fn any_role_in_the_owning_org_may_read_a_domain() {
-        for role in [Role::Admin, Role::Controller, Role::Viewer, Role::Audit] {
-            assert!(may_read_domain(role, ORG_A, Some(ORG_A)).is_ok(), "{role:?}");
+    fn only_an_org_admin_or_super_may_add_a_name() {
+        assert!(may_add_domain(Role::Super, "").is_ok(), "super needs no org");
+        assert!(may_add_domain(Role::Admin, ORG_A).is_ok());
+        assert_eq!(may_add_domain(Role::Admin, "").unwrap_err(), Denial::NoOrg);
+        assert_eq!(may_add_domain(Role::Admin, "0").unwrap_err(), Denial::NoOrg);
+        for role in [Role::Controller, Role::Viewer, Role::Audit, Role::None] {
+            assert_eq!(may_add_domain(role, ORG_A).unwrap_err(), Denial::NotPermitted, "{role:?}");
         }
     }
 
     #[test]
-    fn reading_another_orgs_domain_is_refused() {
-        assert_eq!(may_read_domain(Role::Admin, ORG_A, Some(ORG_B)), Err(Denial::OtherOrg));
-    }
-
-    #[test]
-    fn reading_an_unassigned_domain_is_refused_even_for_a_read() {
-        assert_eq!(may_read_domain(Role::Admin, ORG_A, None), Err(Denial::Unassigned));
-    }
-
-    #[test]
-    fn super_may_read_any_domain() {
-        assert!(may_read_domain(Role::Super, "", None).is_ok());
-        assert!(may_read_domain(Role::Super, ORG_A, Some(ORG_B)).is_ok());
+    fn a_new_name_is_stamped_from_the_callers_claims_not_the_request() {
+        // An Admin naming another tenant is ignored, not obeyed.
+        assert_eq!(
+            owner_for_new(Role::Admin, ORG_A, ORG_B, Some(ORG_A)).as_deref(),
+            Some(ORG_A)
+        );
+        // Super chooses; failing that the parent's owner; failing that nobody.
+        assert_eq!(owner_for_new(Role::Super, "", ORG_B, Some(ORG_A)).as_deref(), Some(ORG_B));
+        assert_eq!(owner_for_new(Role::Super, "", "", Some(ORG_A)).as_deref(), Some(ORG_A));
+        assert_eq!(owner_for_new(Role::Super, "", "", None), None);
     }
 }

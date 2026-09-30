@@ -51,7 +51,7 @@ pub async fn attach(config: &Config, spec: &render::VhostSpec) -> Result<AttachO
     // Rendered first so an invalid request costs nothing.
     let _ = render::render(config, spec)?;
 
-    let cert_dir = config.cert_dir_for(&spec.fqdn);
+    let cert_dir = config.cert_dir_for(spec.cert_zone());
     let missing: Vec<String> = KeyType::ALL
         .iter()
         .filter(|key_type| !cert_dir.join(format!("{key_type}.pem")).exists())
@@ -62,13 +62,13 @@ pub async fn attach(config: &Config, spec: &render::VhostSpec) -> Result<AttachO
         return Err(Error::Invalid(format!(
             "{}: no certificate yet ({} missing from {}); issue one before attaching, \
              or nginx will refuse to load the vhost",
-            spec.fqdn,
+            spec.cert_zone(),
             missing.join(" and "),
             cert_dir.display()
         )));
     }
 
-    let snippet_outcome = snippet::ensure(config, &spec.fqdn)?;
+    let snippet_outcome = snippet::ensure(config, spec.cert_zone())?;
 
     // Kept so a failed check can put things back exactly as they were.
     let vhost_path = config.vhost_path_for(&spec.fqdn);

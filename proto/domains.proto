@@ -164,6 +164,7 @@ message Domain {
   repeated Certificate certificates = 14;
   repeated ManagedRecord records = 15;
   bool has_vhost = 16;
+  string parent_fqdn = 17;       // set for a host under another domain's certificate
 }
 
 message Certificate {
@@ -291,9 +292,31 @@ message ListOrdersResponse {
 
 message AddDomainRequest {
   string access_token = 1;
+  // Any hostname: an apex, or a subdomain of a domain we already manage.
   string fqdn = 2;
+  // Super only; everyone else is stamped with their own organization.
   string organization_id = 3;
   string runner_id = 4;   // optional
+  // Optional. With a runner and instances, the nginx vhost is written as part
+  // of adding the domain, exactly as AttachDomain would.
+  repeated Backend backends = 5;
+  repeated string extra_names = 6;
+  bool no_http_redirect = 7;
+}
+
+// What adding a name turned out to mean. The same request does four different
+// things depending on what already exists, and the caller needs to know which.
+enum AddDomainOutcome {
+  ADD_DOMAIN_OUTCOME_UNSPECIFIED = 0;
+  // Already recorded, and the caller may manage it. Nothing was changed.
+  ADD_DOMAIN_OUTCOME_LINKED = 1;
+  // Not recorded, but already served from the edge's configs; now recorded.
+  ADD_DOMAIN_OUTCOME_ADOPTED = 2;
+  // A subdomain of a domain the caller owns: DNS written through Cloudflare
+  // (and the vhost, when instances were given). Nothing left for the caller.
+  ADD_DOMAIN_OUTCOME_PROVISIONED = 3;
+  // Recorded, but the records have to be created by hand: see required_records.
+  ADD_DOMAIN_OUTCOME_NEEDS_DNS = 4;
 }
 
 // What a BYO customer has to create at their own DNS host before anything
@@ -308,6 +331,10 @@ message RequiredRecord {
 message AddDomainResponse {
   Domain domain = 1;
   repeated RequiredRecord required_records = 2;
+  AddDomainOutcome outcome = 3;
+  // Plain-language account of what was and was not done, including anything
+  // that fell back to manual instructions and why.
+  repeated string notes = 4;
 }
 
 message GetDomainRequest {
@@ -631,6 +658,9 @@ message InventoryEntry {
   repeated string cert_dirs = 9;
   int64 expires_at = 10;
   repeated string findings = 11;
+  // Set when this hostname is issued under another domain's certificate
+  // (staging.example.com under example.com). Empty for a top-level domain.
+  string parent_fqdn = 12;
 }
 
 message ListInventoryRequest {
