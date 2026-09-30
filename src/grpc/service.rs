@@ -70,6 +70,68 @@ struct VhostExtras {
 }
 
 impl Domains {
+    /// The Stripe charge behind `order`, and what the browser needs to pay it.
+    /// Safe to call any number of times for the same order: Billing creates
+    /// the PaymentIntent once per `(consumer, order id)` and returns the same
+    /// one after that, but only hands out its client secret on creation -- so
+    /// a repeat asks for it again. (The stored intent id is written here too,
+    /// which also repairs an order whose first attempt died between creating
+    /// the intent and recording it.)
+    async fn checkout_for(&self, order: crate::db::orders::OrderRow) -> Result<Response<OrderCheckout>, Status> {
+        let order_ref = order.id.to_string();
+        let mut payment_intent = self
+            .billing
+            .create_payment_intent(
+                "domain_management",
+                &order_ref,
+                order.price_cents,
+                &order.currency.to_lowercase(),
+                &[("fqdn", order.fqdn.as_str()), ("organization_id", order.organization_id.as_str())],
+            )
+            .await
+            .map_err(Status::from)?;
+
+        if order.stripe_payment_intent_id.as_deref() != Some(payment_intent.stripe_payment_intent_id.as_str()) {
+            orders_db::set_payment_intent(&self.pool, order.id, &payment_intent.stripe_payment_intent_id)
+                .await
+                .map_err(Status::from)?;
+        }
+
+        if payment_intent.client_secret.is_empty() {
+            payment_intent = self
+                .billing
+                .get_payment_intent_for_checkout(&format!("domain_management:{order_ref}"))
+                .await
+                .map_err(Status::from)?;
+        }
+
+        let order = orders_db::find_order(&self.pool, order.id)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::internal("order vanished mid-checkout"))?;
+
+        Ok(Response::new(OrderCheckout {
+            order: Some(order_response(order)),
+            stripe_client_secret: payment_intent.client_secret,
+            stripe_publishable_key: payment_intent.publishable_key,
+        }))
+    }
+
+    /// A second submit of a quote that already produced an order. Still
+    /// waiting for payment: hand back the same checkout. Anything else: say
+    /// what became of it, because the quote cannot be used again.
+    async fn resume_order(&self, order: crate::db::orders::OrderRow) -> Result<Response<OrderCheckout>, Status> {
+        if order.state == "awaiting_payment" {
+            return self.checkout_for(order).await;
+        }
+        Err(Status::failed_precondition(format!(
+            "this quote already produced order {} ({}); request a new quote to try again",
+            order.id, order.state
+        )))
+    }
+}
+
+impl Domains {
     pub fn new(config: Config, secrets: Secrets, pool: MySqlPool) -> Result<Self, crate::error::Error> {
         let auth = AuthClient::new(&config.auth.grpc_addr)?;
         let billing = BillingClient::new(&config.billing.grpc_addr)?;
@@ -874,7 +936,20 @@ impl DomainService for Domains {
             return Err(Status::resource_exhausted("purchasing cap reached for this organization"));
         }
 
-        let order_id = orders_db::insert_order(
+        // One order per quote: a double submit (a double click, a retried
+        // request) gets the order the first one made, not a second order and a
+        // second charge.
+        if let Some(existing) =
+            orders_db::find_order_by_quote(&self.pool, &req.quote_id).await.map_err(Status::from)?
+        {
+            return self.resume_order(existing).await;
+        }
+
+        if inventory_db::find_domain(&self.pool, &quote.fqdn).await.map_err(Status::from)?.is_some() {
+            return Err(Status::already_exists(format!("{} is already registered here", quote.fqdn)));
+        }
+
+        let order_id = match orders_db::insert_order_with_job(
             &self.pool,
             &quote.fqdn,
             &charge_org,
@@ -887,23 +962,21 @@ impl DomainService for Domains {
             &req.invite_email,
         )
         .await
-        .map_err(Status::from)?;
-
-        let payment_intent = self
-            .billing
-            .create_payment_intent(
-                "domain_management",
-                &order_id.to_string(),
-                quote.price_cents,
-                &quote.currency.to_lowercase(),
-                &[("fqdn", quote.fqdn.as_str()), ("organization_id", charge_org.as_str())],
-            )
-            .await
-            .map_err(Status::from)?;
-
-        orders_db::set_payment_intent(&self.pool, order_id, &payment_intent.stripe_payment_intent_id)
-            .await
-            .map_err(Status::from)?;
+        {
+            Ok(id) => id,
+            Err(err) if orders_db::is_duplicate(&err) => {
+                // Lost a race: either the same quote was submitted at the
+                // same instant, or another order is already buying this name.
+                return match orders_db::find_order_by_quote(&self.pool, &req.quote_id)
+                    .await
+                    .map_err(Status::from)?
+                {
+                    Some(existing) => self.resume_order(existing).await,
+                    None => Err(Status::already_exists(format!("{} is already being bought", quote.fqdn))),
+                };
+            }
+            Err(err) => return Err(Status::from(err)),
+        };
 
         let order = orders_db::find_order(&self.pool, order_id)
             .await
@@ -912,11 +985,7 @@ impl DomainService for Domains {
 
         log!(LogLevel::Info, "{}: order {} created ({}c)", order.fqdn, order_id, order.price_cents);
 
-        Ok(Response::new(OrderCheckout {
-            order: Some(order_response(order)),
-            stripe_client_secret: payment_intent.client_secret,
-            stripe_publishable_key: payment_intent.publishable_key,
-        }))
+        self.checkout_for(order).await
     }
 
     /// AUTHZ: Action::Read on ResourceType::Domain, and the order's owning
