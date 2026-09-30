@@ -2725,6 +2725,7 @@ mod authorization_contracts {
         // address is never dialled: `connect_lazy` only registers with the
         // reactor, and no test here gets far enough to make a call.
         config.auth.grpc_addr = "http://127.0.0.1:1".to_owned();
+        config.billing.grpc_addr = "http://127.0.0.1:1".to_owned();
 
         Domains::new(config, secrets, pool).expect("service")
     }

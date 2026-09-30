@@ -49,6 +49,8 @@ impl TestDb {
         let _ = std::fs::remove_dir_all(&dir);
         let data = dir.join("data");
         std::fs::create_dir_all(&data).unwrap();
+        let tmp = dir.join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
 
         // Same install-step race `tests/worker.rs` guards against: two
         // instances starting at once collide on `mariadb-install-db`'s
@@ -58,6 +60,7 @@ impl TestDb {
             let _guard = INSTALL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             Command::new("mariadb-install-db")
                 .arg(format!("--datadir={}", data.display()))
+                .arg(format!("--tmpdir={}", tmp.display()))
                 .arg("--auth-root-authentication-method=normal")
                 .arg("--skip-test-db")
                 .output()
@@ -73,6 +76,7 @@ impl TestDb {
         let server = Command::new("mariadbd")
             .arg(format!("--datadir={}", data.display()))
             .arg(format!("--socket={}", socket.display()))
+            .arg(format!("--tmpdir={}", tmp.display()))
             .arg("--skip-networking")
             .arg("--skip-grant-tables")
             .arg(format!("--pid-file={}", dir.join("mysqld.pid").display()))
@@ -100,7 +104,18 @@ impl TestDb {
             .connect_with(base_options.database("lifecycle_test"))
             .await
             .expect("connect to the test database");
-        db::migrate(&pool).await.expect("run migrations");
+        // `db::migrate` is a deliberate no-op (migrations are applied by hand
+        // in production), so apply the same files the same way here.
+        let mut files: Vec<_> = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
+            .expect("read migrations/")
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "sql"))
+            .collect();
+        files.sort();
+        for file in files {
+            let sql = std::fs::read_to_string(&file).unwrap();
+            sqlx::raw_sql(&sql).execute(&pool).await.unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+        }
 
         Self { dir: dir.clone(), server, pool }
     }
