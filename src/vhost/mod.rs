@@ -12,7 +12,14 @@
 //! Everything already in this tree was written by hand, often with CORS
 //! rules, `OPTIONS` handling and per-site quirks no template reproduces.
 //! Those are read, reported and left alone.
+//!
+//! * [`freeform`] -- the escape hatch for a config the structured `render`
+//!   path (even with its extras) cannot express: raw text, validated and
+//!   mechanically normalized against a staged copy, then applied under its
+//!   own marker so it is likewise never touched by `render`'s structured
+//!   path.
 
+pub mod freeform;
 pub mod render;
 pub mod snippet;
 
