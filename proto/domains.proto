@@ -21,11 +21,11 @@ service DomainService {
   rpc GetOrder(GetOrderRequest) returns (Order);
   rpc ListOrders(ListOrdersRequest) returns (ListOrdersResponse);
 
-  // Called only by Portal's /v1/webhooks/stripe, which forwards the raw
-  // request body and the Stripe-Signature header untouched. This service
-  // verifies the signature; a domain is never registered because a browser
-  // claimed the payment succeeded.
-  rpc HandleStripeWebhook(StripeWebhookRequest) returns (StripeWebhookResponse);
+  // No HandleStripeWebhook here: Stripe integration (including webhook
+  // signature verification) lives entirely in the `Billing` service now --
+  // see billing.proto, vendored in this repo, and src/billing.rs. Portal's
+  // webhook-forwarding route should call Billing's HandleStripeWebhook
+  // directly rather than relaying through this service.
 
   // --- lifecycle ------------------------------------------------------
   rpc AddDomain(AddDomainRequest) returns (AddDomainResponse);
@@ -38,6 +38,8 @@ service DomainService {
   // --- vhosts ---------------------------------------------------------
   rpc AttachDomain(AttachDomainRequest) returns (Domain);
   rpc DetachDomain(DetachDomainRequest) returns (Domain);
+  rpc ValidateFreeformVhost(ValidateFreeformVhostRequest) returns (ValidateFreeformVhostResponse);
+  rpc ApplyFreeformVhost(ApplyFreeformVhostRequest) returns (ApplyFreeformVhostResponse);
 
   // --- members --------------------------------------------------------
   // Cloudflare account invites scoped to one zone, so a customer can manage
@@ -45,6 +47,19 @@ service DomainService {
   rpc InviteDomainMember(InviteDomainMemberRequest) returns (DomainMember);
   rpc ListDomainMembers(ListDomainMembersRequest) returns (ListDomainMembersResponse);
   rpc RemoveDomainMember(RemoveDomainMemberRequest) returns (RemoveDomainMemberResponse);
+
+  // --- dns records -----------------------------------------------------
+  //
+  // Arbitrary record CRUD scoped to a domain the caller owns -- distinct
+  // from `ManagedRecord` (this service's own edge/challenge bookkeeping,
+  // reconciled automatically) and from the purchase-time `RequiredRecord`s
+  // a BYO customer is told to create by hand. This is the caller-facing
+  // "make a DNS tweak" surface, backed by the same Cloudflare zone token
+  // AttachDomain and the challenge-CNAME automation already use.
+  rpc ListDnsRecords(ListDnsRecordsRequest) returns (ListDnsRecordsResponse);
+  rpc CreateDnsRecord(CreateDnsRecordRequest) returns (CreateDnsRecordResponse);
+  rpc UpdateDnsRecord(UpdateDnsRecordRequest) returns (UpdateDnsRecordResponse);
+  rpc DeleteDnsRecord(DeleteDnsRecordRequest) returns (DeleteDnsRecordResponse);
 
   // --- adoption and attachment ----------------------------------------
   //
@@ -243,6 +258,9 @@ message CreateOrderRequest {
   string organization_id = 3;           // must match the caller's org unless Super
   string runner_id = 4;        // optional: attach on success
   string invite_email = 5;     // optional: who to invite to the zone afterwards
+  // Spending money needs a fresh password check, the same bar every other
+  // write-that-spends-or-destroys in this service sits behind.
+  string elevated_token = 6;
 }
 
 message OrderCheckout {
@@ -265,15 +283,6 @@ message ListOrdersRequest {
 
 message ListOrdersResponse {
   repeated Order orders = 1;
-}
-
-message StripeWebhookRequest {
-  bytes payload = 1;       // the raw body, byte for byte
-  string signature = 2;    // the Stripe-Signature header
-}
-
-message StripeWebhookResponse {
-  bool handled = 1;
 }
 
 // ---------------------------------------------------------------------
@@ -359,8 +368,19 @@ message DomainEvent {
 // own config. The caller placed the repo on the node and read its config, so
 // it is the one that knows both.
 message Backend {
+  // Node-id form: becomes `ahpn-<node_id>.ah.internal:<port>`.
   string node_id = 1;
   uint32 port = 2;
+  // Static form: a raw host:port the caller already knows is reachable, for
+  // a config this service cannot derive from a runner's deployment. A
+  // non-empty `host` selects this form instead of the node-id form above --
+  // exactly one of `node_id` or `host` must be set.
+  string host = 3;
+  bool tls = 4;                     // proxy_pass https:// instead of http://
+  // Only meaningful when `tls` is set. Defaults false (verify), matching
+  // protobuf's own bool default -- a caller who forgets to set this field
+  // gets a *verified* backend, never a silently unverified one.
+  bool insecure_skip_verify = 5;    // true emits `proxy_ssl_verify off;`
 }
 
 message AttachDomainRequest {
@@ -375,11 +395,86 @@ message AttachDomainRequest {
   repeated string extra_names = 5;
   // Emit the port-80 server redirecting to HTTPS. Default on.
   bool no_http_redirect = 6;
+  // A small, closed set of per-vhost extras -- CORS/OPTIONS handling, extra
+  // headers, and a couple of recurring extra location-block shapes seen in
+  // hand-written vhosts. Deliberately not arbitrary directive text: anything
+  // this can't express is what ValidateFreeformVhost/ApplyFreeformVhost is
+  // for.
+  repeated HeaderEntry extra_headers = 7;
+  CorsPolicy cors = 8;
+  repeated ExtraLocation extra_locations = 9;
+}
+
+message HeaderEntry {
+  string name = 1;
+  string value = 2;
+}
+
+// Renders the same `add_header`/`if ($request_method = 'OPTIONS')` shape
+// already hand-written on every CORS-enabled vhost in the fleet.
+message CorsPolicy {
+  string allow_origin = 1;
+  string allow_methods = 2;
+  string allow_headers = 3;
+  string expose_headers = 4;
+}
+
+enum LocationKind {
+  LOCATION_KIND_UNSPECIFIED = 0;
+  // proxy_http_version 1.1 + Upgrade/Connection headers, proxied to the
+  // same upstream as `location /`.
+  LOCATION_KIND_WEBSOCKET = 1;
+  // `deny all;` -- the hidden-files-block pattern.
+  LOCATION_KIND_DENY_ALL = 2;
+}
+
+message ExtraLocation {
+  string path = 1;   // e.g. "/live/websocket", "~ /\."
+  LocationKind kind = 2;
 }
 
 message DetachDomainRequest {
   string access_token = 1;
   string id_or_fqdn = 2;
+}
+
+// ---------------------------------------------------------------------
+// Freeform vhosts -- the escape hatch for a config the structured Backend
+// + extras shape above cannot express. Validate/correct before ever
+// applying; nginx -t against a staged copy is the only authority on
+// validity, everything else here is advisory.
+// ---------------------------------------------------------------------
+
+message FreeformLintFinding {
+  string code = 1;       // reuses inventory::model::FindingCode names where applicable
+  string severity = 2;   // info | warn | error
+  string message = 3;
+}
+
+message ValidateFreeformVhostRequest {
+  string access_token = 1;
+  string id_or_fqdn = 2;
+  string server_block = 3;   // raw nginx text, one or more `server {}` blocks
+}
+
+message ValidateFreeformVhostResponse {
+  bool nginx_ok = 1;                          // `nginx -t` against a tree with this file staged
+  string nginx_output = 2;                    // raw nginx -t output on failure
+  repeated FreeformLintFinding new_findings = 3;  // findings this file would introduce
+  string corrected = 4;                       // best-effort mechanical normalization; empty if unchanged
+}
+
+message ApplyFreeformVhostRequest {
+  string elevated_token = 1;
+  string id_or_fqdn = 2;
+  string server_block = 3;
+  bool dry_run = 4;   // validate + would-apply, write nothing
+}
+
+message ApplyFreeformVhostResponse {
+  bool applied = 1;
+  string diff = 2;                        // empty if newly created
+  ValidateFreeformVhostResponse validation = 3;
 }
 
 // ---------------------------------------------------------------------
@@ -409,6 +504,60 @@ message RemoveDomainMemberRequest {
 }
 
 message RemoveDomainMemberResponse {
+  bool success = 1;
+}
+
+// ---------------------------------------------------------------------
+// DNS records (caller-facing CRUD, scoped to one owned domain)
+// ---------------------------------------------------------------------
+
+message DnsRecordEntry {
+  string id = 1;             // this service's own row id, not Cloudflare's
+  string cf_record_id = 2;
+  string type = 3;            // A, AAAA, CNAME, TXT, MX, etc -- whatever Cloudflare accepts
+  string name = 4;
+  string content = 5;
+  uint32 ttl = 6;              // 1 means "automatic" (Cloudflare's convention)
+  bool proxied = 7;            // only meaningful for A/AAAA/CNAME
+}
+
+message ListDnsRecordsRequest {
+  string access_token = 1;
+  string id_or_fqdn = 2;
+}
+
+message ListDnsRecordsResponse {
+  repeated DnsRecordEntry records = 1;
+}
+
+message CreateDnsRecordRequest {
+  string access_token = 1;
+  string id_or_fqdn = 2;
+  DnsRecordEntry record = 3;   // id/cf_record_id ignored on input
+}
+
+message CreateDnsRecordResponse {
+  DnsRecordEntry record = 1;
+}
+
+message UpdateDnsRecordRequest {
+  string access_token = 1;
+  string id_or_fqdn = 2;
+  string id = 3;               // this service's row id
+  DnsRecordEntry record = 4;
+}
+
+message UpdateDnsRecordResponse {
+  DnsRecordEntry record = 1;
+}
+
+message DeleteDnsRecordRequest {
+  string elevated_token = 1;
+  string id_or_fqdn = 2;
+  string id = 3;
+}
+
+message DeleteDnsRecordResponse {
   bool success = 1;
 }
 

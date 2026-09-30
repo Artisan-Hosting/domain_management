@@ -34,5 +34,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .compile_protos(&["proto/accounts.proto"], &["proto"])?;
 
+    // === billing.proto, vendored from the Billing crate ===
+    //
+    // Stripe integration lives in `Billing` and nowhere else -- this service
+    // never holds a Stripe key. Same vendoring arrangement as
+    // accounts.proto: does NOT auto-sync, run `make sync-proto` after
+    // editing Billing's copy.
+    println!("cargo:rerun-if-changed=proto/billing.proto");
+
+    tonic_prost_build::configure()
+        .build_server(false)
+        .build_client(true)
+        .compile_protos(&["proto/billing.proto"], &["proto"])?;
+
     Ok(())
 }
