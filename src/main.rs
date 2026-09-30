@@ -8,8 +8,21 @@
 //!
 //! Run it as a service (`serve`), or reach for the same code paths by hand
 //! the way the old scripts were run: `issue <domain>`, `publish`, `import`.
+//!
+//! This binary *is* subsystem 1 from the crate root doc -- everything
+//! below `Command::Serve` is CLI-only and never touches the gRPC service
+//! or (once it exists) the job worker directly. `Command::Serve` is where
+//! this process hands off to subsystem 2 ([`grpc::serve`]); the CLI
+//! commands exist so an operator can do the same work the API eventually
+//! automates, by hand, without a live database or a running service --
+//! [`issue_one`]'s own doc comment is explicit about why that matters at
+//! 3am. Kept in mind for later: once `force_renew` (the gRPC equivalent of
+//! `issue`) is implemented, it should call the same extracted issuance
+//! logic this function uses, not duplicate it -- two copies of "should
+//! this renew" drifting apart is how a renewal loop starts ignoring rate
+//! limits in one of the two places that check for them.
 
-use ais_domains::{acme, auth, cloudflare, config, db, error, grpc, inventory, publish, vhost};
+use ais_domains::{acme, auth, config, db, error, grpc, inventory, publish, vhost};
 use artisan_middleware::dusa_collection_utils::core::logger::{LogLevel, set_log_level};
 use artisan_middleware::dusa_collection_utils::log;
 use clap::{Parser, Subcommand};
@@ -407,12 +420,6 @@ async fn issue_one(config: Config, secrets: Secrets, domain: &str, force: bool) 
         ("CF_CHALLENGE_TOKEN", &secrets.cf_challenge_token),
     ])?;
 
-    if config.acme.alias_zone_id.is_empty() {
-        return Err(error::Error::Config(
-            "acme.alias_zone_id is not set; challenge records have nowhere to go".to_owned(),
-        ));
-    }
-
     // Skip the work if the certificate on disk is still good, unless told
     // otherwise. Let's Encrypt's rate limits are per registered domain per
     // week, and a renewal loop that ignores them locks everyone out.
@@ -429,25 +436,18 @@ async fn issue_one(config: Config, secrets: Secrets, domain: &str, force: bool) 
         }
     }
 
-    let cf = cloudflare::CfSuite::new(&config, &secrets)?;
-    let challenge_target = config.challenge_target_for(domain);
-
-    let account = acme::account::load_or_create(&config).await?;
-    let issuer = acme::issue::Issuer::new(config.clone(), cf)?;
-
-    let certs = issuer.issue_pair(&account, domain, &challenge_target).await?;
-    acme::install::write_pair(&config, domain, &certs)?;
+    let (installed, snippet_outcome) = acme::issue_and_install(&config, &secrets, domain).await?;
 
     log!(
         LogLevel::Info,
         "{domain}: issued {} certificate(s) into {}",
-        certs.len(),
+        installed.len(),
         config.cert_dir_for(domain).display()
     );
 
     // The step that used to be manual: without a snippet linking the pair,
     // the certificate renews forever and nothing serves it.
-    match vhost::snippet::ensure(&config, domain)? {
+    match snippet_outcome {
         vhost::snippet::SnippetOutcome::Created(path) => {
             log!(LogLevel::Info, "{domain}: wrote {}", path.display());
             log!(

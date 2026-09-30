@@ -31,9 +31,17 @@ use crate::error::{Error, Result};
 /// How deep `include` chains may nest before we assume a cycle.
 const MAX_INCLUDE_DEPTH: usize = 16;
 
-/// Marks a file this service generated. Only files carrying it are ever
-/// rewritten; everything else is somebody's handiwork.
+/// Marks a file this service generated from a structured [`crate::vhost::render::VhostSpec`].
+/// Only files carrying it are ever rewritten by that structured path;
+/// everything else is somebody's handiwork.
 pub const MANAGED_HEADER: &str = "managed by ais_domains";
+
+/// Marks a file applied through [`crate::vhost::freeform`]. Deliberately does
+/// not contain [`MANAGED_HEADER`] as a substring: a freeform submission is
+/// "owned" in the sense that the freeform API can update it again, but the
+/// structured `render::write()` path must never touch it, exactly like a
+/// genuinely hand-written file.
+pub const FREEFORM_MANAGED_HEADER: &str = "applied via ais_domains freeform vhost";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NginxIndex {

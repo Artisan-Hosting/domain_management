@@ -96,8 +96,8 @@ async fn attaching_two_instances_writes_a_balanced_vhost_and_its_snippet() {
     let outcome = ais_domains::vhost::attach(
         &f.config,
         &spec(vec![
-            Backend { node_id: "2973453917896704".to_owned(), port: 8093 },
-            Backend { node_id: "3091229306929152".to_owned(), port: 8093 },
+            Backend::Node { node_id: "2973453917896704".to_owned(), port: 8093 },
+            Backend::Node { node_id: "3091229306929152".to_owned(), port: 8093 },
         ]),
     )
     .await
@@ -122,14 +122,14 @@ async fn attaching_two_instances_writes_a_balanced_vhost_and_its_snippet() {
 #[tokio::test]
 async fn scaling_out_rewrites_the_upstream_only() {
     let f = fixture("scale", true, true);
-    let one = vec![Backend { node_id: "node1".to_owned(), port: 8093 }];
+    let one = vec![Backend::Node { node_id: "node1".to_owned(), port: 8093 }];
 
     ais_domains::vhost::attach(&f.config, &spec(one.clone())).await.unwrap();
     let before = std::fs::read_to_string(f.config.vhost_path_for("example.com")).unwrap();
     assert!(!before.contains("random;"));
 
     let mut two = one;
-    two.push(Backend { node_id: "node2".to_owned(), port: 8093 });
+    two.push(Backend::Node { node_id: "node2".to_owned(), port: 8093 });
     let outcome = ais_domains::vhost::attach(&f.config, &spec(two)).await.unwrap();
 
     assert!(matches!(outcome.vhost, VhostOutcome::Updated(_)));
@@ -149,7 +149,7 @@ async fn a_vhost_nginx_rejects_leaves_no_trace() {
 
     let err = ais_domains::vhost::attach(
         &f.config,
-        &spec(vec![Backend { node_id: "node1".to_owned(), port: 8093 }]),
+        &spec(vec![Backend::Node { node_id: "node1".to_owned(), port: 8093 }]),
     )
     .await
     .unwrap_err();
@@ -166,7 +166,7 @@ async fn a_rejected_rewrite_restores_what_was_there() {
     // The worse case: the domain was already serving, and re-attaching it
     // with a bad set of instances must not cost it its working vhost.
     let f = fixture("restore", true, true);
-    let good = vec![Backend { node_id: "node1".to_owned(), port: 8093 }];
+    let good = vec![Backend::Node { node_id: "node1".to_owned(), port: 8093 }];
     ais_domains::vhost::attach(&f.config, &spec(good)).await.unwrap();
 
     let working = std::fs::read_to_string(f.config.vhost_path_for("example.com")).unwrap();
@@ -180,7 +180,7 @@ async fn a_rejected_rewrite_restores_what_was_there() {
 
     let err = ais_domains::vhost::attach(
         &f.config,
-        &spec(vec![Backend { node_id: "node9".to_owned(), port: 9999 }]),
+        &spec(vec![Backend::Node { node_id: "node9".to_owned(), port: 9999 }]),
     )
     .await
     .unwrap_err();
@@ -199,7 +199,7 @@ async fn attaching_before_the_certificate_exists_says_so() {
 
     let err = ais_domains::vhost::attach(
         &f.config,
-        &spec(vec![Backend { node_id: "node1".to_owned(), port: 8093 }]),
+        &spec(vec![Backend::Node { node_id: "node1".to_owned(), port: 8093 }]),
     )
     .await
     .unwrap_err();
@@ -227,7 +227,7 @@ async fn a_hand_written_vhost_survives_an_attach() {
 
     let outcome = ais_domains::vhost::attach(
         &f.config,
-        &spec(vec![Backend { node_id: "node1".to_owned(), port: 8093 }]),
+        &spec(vec![Backend::Node { node_id: "node1".to_owned(), port: 8093 }]),
     )
     .await
     .unwrap();

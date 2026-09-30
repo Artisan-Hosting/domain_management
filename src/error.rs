@@ -19,8 +19,8 @@ pub enum Error {
     #[error("cloudflare: {0}")]
     Cloudflare(String),
 
-    #[error("stripe: {0}")]
-    Stripe(String),
+    #[error("billing: {0}")]
+    Billing(String),
 
     #[error("acme: {0}")]
     Acme(String),

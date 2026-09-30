@@ -163,3 +163,156 @@ pub async fn remove_challenge_txt(api: &Api, zone_id: &str, record_ids: &[String
 
     failures
 }
+
+/// Ensures `_acme-challenge.<fqdn>` CNAMEs to `challenge_target` in a zone
+/// this service controls (a purchased domain, or a BYO one whose
+/// nameservers now point at Cloudflare). This is the automation that used
+/// to be a manual DNS step after buying or importing a domain: nothing
+/// issues against `challenge_target` until this record exists, and
+/// `FindingCode::MissingChallengeCname` is the scanner catching it when it
+/// doesn't.
+///
+/// Called on `cf.zones` (the account-wide zone/DNS credential), never
+/// `cf.challenge` (scoped only to the alias zone itself) -- this writes
+/// into the *customer's* zone, not the shared alias zone the TXT values
+/// above live on.
+///
+/// A long TTL on purpose: unlike the per-issuance TXT values, this record is
+/// long-lived infrastructure, not something a renewal churns every few
+/// weeks.
+///
+/// One function, two callers in two different subsystems (see the crate
+/// root doc): `add_domain`'s BYO body calls this synchronously, inline in
+/// the gRPC handler (subsystem 2) right after the zone is found to already
+/// exist -- a single idempotent upsert costs nothing to retry, so it needs
+/// no job. The `register` job (subsystem 3, landing with the purchase
+/// flow) calls the same function from inside a worker, right after
+/// `zones::ensure` creates a brand-new zone and before the first
+/// `acme::issue::Issuer::issue_pair` call -- issuance would otherwise race
+/// a CNAME that isn't there yet. Both callers are expected to exist; if you
+/// only find one, the other's phase hasn't landed yet, not a bug.
+const CHALLENGE_CNAME_TTL: u32 = 300;
+
+pub async fn ensure_challenge_cname(
+    api: &Api,
+    zone_id: &str,
+    fqdn: &str,
+    challenge_target: &str,
+) -> Result<DnsRecord> {
+    upsert(
+        api,
+        zone_id,
+        "CNAME",
+        &format!("_acme-challenge.{fqdn}"),
+        challenge_target,
+        CHALLENGE_CNAME_TTL,
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// A minimal, sequential HTTP/1.1 mock: one canned `(status, json body)`
+    /// response per accepted connection, served in order. Enough to stand
+    /// in for Cloudflare's envelope shape without pulling in a mocking
+    /// crate for a handful of endpoints -- the same call this service's own
+    /// `Api` makes not to do that either.
+    async fn mock_server(responses: Vec<(u16, String)>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+
+                let response = format!(
+                    "HTTP/1.1 {status} status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    fn api(base: &str) -> Api {
+        Api::new(base, "test-token", "test", Duration::from_secs(5)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn creates_the_cname_when_none_exists() {
+        let base = mock_server(vec![
+            (200, r#"{"success":true,"result":[]}"#.to_owned()),
+            (
+                200,
+                r#"{"success":true,"result":{"id":"rec1","type":"CNAME","name":"_acme-challenge.example.com","content":"target.acme.artisanhosting.net","ttl":300}}"#
+                    .to_owned(),
+            ),
+        ])
+        .await;
+
+        let record = ensure_challenge_cname(&api(&base), "zone1", "example.com", "target.acme.artisanhosting.net")
+            .await
+            .unwrap();
+
+        assert_eq!(record.record_type, "CNAME");
+        assert_eq!(record.content, "target.acme.artisanhosting.net");
+    }
+
+    #[tokio::test]
+    async fn updates_the_cname_when_the_content_differs() {
+        let base = mock_server(vec![
+            (
+                200,
+                r#"{"success":true,"result":[{"id":"rec1","type":"CNAME","name":"_acme-challenge.example.com","content":"stale.acme.artisanhosting.net","ttl":300}]}"#
+                    .to_owned(),
+            ),
+            (
+                200,
+                r#"{"success":true,"result":{"id":"rec1","type":"CNAME","name":"_acme-challenge.example.com","content":"target.acme.artisanhosting.net","ttl":300}}"#
+                    .to_owned(),
+            ),
+        ])
+        .await;
+
+        let record = ensure_challenge_cname(&api(&base), "zone1", "example.com", "target.acme.artisanhosting.net")
+            .await
+            .unwrap();
+
+        assert_eq!(record.content, "target.acme.artisanhosting.net");
+    }
+
+    #[tokio::test]
+    async fn leaves_a_matching_cname_alone() {
+        // Only one response queued: if this called update or create instead
+        // of recognising the match, the second request would hang waiting
+        // for a connection nothing accepts, and the test would time out
+        // rather than fail cleanly -- which is itself the point.
+        let base = mock_server(vec![(
+            200,
+            r#"{"success":true,"result":[{"id":"rec1","type":"CNAME","name":"_acme-challenge.example.com","content":"target.acme.artisanhosting.net","ttl":300}]}"#
+                .to_owned(),
+        )])
+        .await;
+
+        let record = tokio::time::timeout(
+            Duration::from_secs(2),
+            ensure_challenge_cname(&api(&base), "zone1", "example.com", "target.acme.artisanhosting.net"),
+        )
+        .await
+        .expect("must not need a second request")
+        .unwrap();
+
+        assert_eq!(record.content, "target.acme.artisanhosting.net");
+    }
+}

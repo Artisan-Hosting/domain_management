@@ -11,6 +11,8 @@
 //! [`CfSuite::registrar`] can spend money.
 
 pub mod dns;
+pub mod members;
+pub mod registrar;
 pub mod zones;
 
 use serde::{Deserialize, de::DeserializeOwned};

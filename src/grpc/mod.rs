@@ -3,6 +3,16 @@
 //! Binds the private network only (see `config::Grpc::bind`): Portal is the
 //! platform's single public entry point and forwards everything here, the
 //! same shape ais_auth and ais_secretserver already have.
+//!
+//! This is subsystem 2 of the three described in the crate root doc. Its
+//! entry point, [`serve`], is also where subsystem 3 (the async job
+//! worker) starts once it exists: both will share the one
+//! [`sqlx::MySqlPool`] and [`crate::config::Config`]/[`crate::config::Secrets`]
+//! pair built here, so the worker begins as one more `tokio::spawn` call in
+//! this function rather than a second binary -- splitting it into its own
+//! process later is a deployment change, not a code change, because the
+//! `jobs` table (not this process boundary) is what makes concurrent
+//! claims safe.
 
 pub mod authz;
 pub mod service;
@@ -46,6 +56,14 @@ pub async fn serve(config: Config, secrets: Secrets, pool: MySqlPool) -> Result<
         .identity(identity)
         .client_ca_root(ca_cert);
 
+    // Spawned before `config`/`secrets`/`pool` are consumed below: the
+    // worker (subsystem 3) needs its own clones of the same three --
+    // `Config`/`Secrets` are `Clone`, and `MySqlPool` is a cheap handle to
+    // the same pool by design -- and there is nothing left to clone from
+    // once `Domains::new` has taken ownership of the originals.
+    let worker = crate::worker::Worker::new(pool.clone(), config.clone(), secrets.clone())?;
+    let worker_task = tokio::spawn(worker.run());
+
     let reflection_enabled = config.grpc.reflection;
     let service = service::Domains::new(config, secrets, pool)?;
 
@@ -65,10 +83,17 @@ pub async fn serve(config: Config, secrets: Secrets, pool: MySqlPool) -> Result<
 
     log!(LogLevel::Info, "gRPC listening on {}", addr);
 
-    router
+    let result = router
         .serve_with_shutdown(addr, shutdown_signal())
         .await
-        .map_err(|e| Error::Config(format!("gRPC server: {e}")))
+        .map_err(|e| Error::Config(format!("gRPC server: {e}")));
+
+    // `Worker::run` never returns on its own; once the server itself has
+    // stopped accepting connections there is nothing left for it to serve
+    // a result to, so its task is aborted rather than awaited.
+    worker_task.abort();
+
+    result
 }
 
 /// SIGINT or SIGTERM. systemd sends SIGTERM, so ignoring it means every

@@ -1,13 +1,30 @@
 //! `DomainService` implementation.
 //!
-//! Handlers here stay thin on purpose: authorize, read or write the
-//! database, enqueue a job. Anything that talks to Cloudflare, Let's Encrypt
-//! or R2 happens in a worker, because those calls take seconds to minutes and
-//! must survive a restart -- a registration in particular spends money, so it
-//! cannot live only in the memory of an RPC that might be cancelled halfway.
+//! Handlers here stay thin on purpose: authorize, then read or write the
+//! database. What happens after that authorization check splits along one
+//! line, and it isn't "does this call Cloudflare" -- several handlers below
+//! do (`create_dns_record`, `update_dns_record`, `delete_dns_record`,
+//! and eventually `add_domain`'s BYO path) and still run synchronously,
+//! inline in the RPC. The line is **can this be retried for free**:
+//!
+//! * A single Cloudflare DNS record write, or
+//!   [`crate::cloudflare::dns::ensure_challenge_cname`]'s upsert, costs
+//!   nothing to fail and retry -- there is no partial state to clean up and
+//!   nothing it does spends money. Those run inline, and the RPC's own
+//!   error is the retry signal: the caller sees a failed call and tries
+//!   again, same as any other request.
+//! * Registering a domain through Cloudflare Registrar is the opposite: it
+//!   spends money, can take real wall-clock time, and running it twice
+//!   because a request was retried or an RPC got cancelled mid-flight means
+//!   charging twice. That work is a `jobs` row, claimed and retried by the
+//!   worker described in [the crate root doc][crate] (subsystem 3), never
+//!   run from inside a handler here.
 //!
 //! Phase 1 is the script-parity work (issuance and publishing); the RPCs that
-//! are not wired yet return `unimplemented` rather than pretending.
+//! are not wired yet return `unimplemented` rather than pretending. See each
+//! stub's `AUTHZ:` comment for the authorization it will need once its body
+//! is written -- those notes are RBAC Phase 6's mapping, meant to be reused
+//! verbatim rather than re-derived.
 
 use artisan_middleware::api::claims::Claims;
 use artisan_middleware::dusa_collection_utils::core::logger::LogLevel;
@@ -15,16 +32,24 @@ use artisan_middleware::dusa_collection_utils::log;
 use artisan_middleware::api::roles::Role;
 use artisan_middleware::api::claims::TokenType;
 use artisan_middleware::identity::{Action, ResourceType};
-use sqlx::MySqlPool;
+use sqlx::{MySqlPool, Row};
 use std::pin::Pin;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
+use crate::acme::KeyType;
 use crate::auth::AuthClient;
+use crate::billing::BillingClient;
+use crate::dns::probe::Probe;
 use crate::grpc::authz;
 use crate::config::{Config, Secrets};
+use crate::db::dns_records as dns_records_db;
+use crate::db::domains as domains_db;
 use crate::db::inventory as inventory_db;
+use crate::db::orders as orders_db;
+use crate::db::releases as releases_db;
 use crate::inventory::scan;
+use crate::purchasing;
 use crate::proto::domains::*;
 use crate::proto::domains::domain_service_server::DomainService;
 
@@ -33,12 +58,14 @@ pub struct Domains {
     secrets: Secrets,
     pool: MySqlPool,
     auth: AuthClient,
+    billing: BillingClient,
 }
 
 impl Domains {
     pub fn new(config: Config, secrets: Secrets, pool: MySqlPool) -> Result<Self, crate::error::Error> {
         let auth = AuthClient::new(&config.auth.grpc_addr)?;
-        Ok(Self { config, secrets, pool, auth })
+        let billing = BillingClient::new(&config.billing.grpc_addr)?;
+        Ok(Self { config, secrets, pool, auth, billing })
     }
 
     /// Who is calling. Every token is checked with ais_auth rather than
@@ -414,6 +441,63 @@ fn source_code(source: &str) -> i32 {
     }
 }
 
+/// A wire `Backend` selects the node-id or static form by which field is
+/// non-empty. Exactly one of `node_id`/`host` may be set -- ambiguity here
+/// would otherwise silently prefer one form over the other.
+fn backend_from_proto(backend: crate::proto::domains::Backend) -> Result<crate::vhost::render::Backend, Status> {
+    let has_node = !backend.node_id.is_empty();
+    let has_host = !backend.host.is_empty();
+
+    match (has_node, has_host) {
+        (true, true) => Err(Status::invalid_argument(
+            "a backend must set exactly one of node_id or host, not both",
+        )),
+        (false, false) => Err(Status::invalid_argument("a backend must set node_id or host")),
+        (true, false) => {
+            // A port is a u16 on the wire's u32; anything above that is a
+            // caller bug, not something to truncate silently.
+            let port = u16::try_from(backend.port)
+                .map_err(|_| Status::invalid_argument(format!("port {} does not fit in u16", backend.port)))?;
+            Ok(crate::vhost::render::Backend::Node { node_id: backend.node_id, port })
+        }
+        (false, true) => {
+            let port = u16::try_from(backend.port)
+                .map_err(|_| Status::invalid_argument(format!("port {} does not fit in u16", backend.port)))?;
+            Ok(crate::vhost::render::Backend::Static {
+                host: backend.host,
+                port,
+                tls: backend.tls,
+                insecure_skip_verify: backend.insecure_skip_verify,
+            })
+        }
+    }
+}
+
+fn freeform_response(outcome: crate::vhost::freeform::ValidateOutcome) -> ValidateFreeformVhostResponse {
+    ValidateFreeformVhostResponse {
+        nginx_ok: outcome.nginx_ok,
+        nginx_output: outcome.nginx_output,
+        new_findings: outcome
+            .new_findings
+            .into_iter()
+            .map(|f| FreeformLintFinding { code: f.code, severity: f.severity, message: f.message })
+            .collect(),
+        corrected: outcome.corrected,
+    }
+}
+
+fn dns_record_response(row: crate::db::dns_records::DnsRecordRow) -> DnsRecordEntry {
+    DnsRecordEntry {
+        id: row.id.to_string(),
+        cf_record_id: row.cf_record_id,
+        r#type: row.record_type,
+        name: row.name,
+        content: row.content,
+        ttl: row.ttl,
+        proxied: row.proxied,
+    }
+}
+
 fn status_code(status: &str) -> i32 {
     match status {
         "pending_payment" => DomainStatus::PendingPayment as i32,
@@ -429,81 +513,1236 @@ fn status_code(status: &str) -> i32 {
     }
 }
 
+fn key_type_code(key_type: &str) -> i32 {
+    match key_type {
+        "ecc" => KeyType::Ecc as i32,
+        "rsa" => KeyType::Rsa as i32,
+        _ => 0,
+    }
+}
+
+fn cert_response(domain_id: u64, row: domains_db::CertRow) -> Certificate {
+    Certificate {
+        domain_id: domain_id.to_string(),
+        key_type: key_type_code(&row.key_type),
+        serial: row.serial.unwrap_or_default(),
+        not_before: row.not_before.unwrap_or(0),
+        not_after: row.not_after.unwrap_or(0),
+        renew_after: row.renew_after.unwrap_or(0),
+        fail_count: row.fail_count,
+        last_error: row.last_error.unwrap_or_default(),
+    }
+}
+
+/// The common fields every lifecycle handler (`AddDomain`, `RemoveDomain`,
+/// `VerifyDomainNow`, `DetachDomain`, ...) returns. `GetDomain` alone also
+/// attaches certificates and managed records -- see its own handler --
+/// mirroring how `attach_domain`/`assign_domain` already return a Domain
+/// with those left empty rather than joining them on every write.
+fn domain_response(row: &domains_db::DomainRow) -> Domain {
+    Domain {
+        id: row.id.to_string(),
+        fqdn: row.fqdn.clone(),
+        organization_id: row.organization_id.clone().unwrap_or_default(),
+        runner_id: row.runner_id.clone().unwrap_or_default(),
+        source: source_code(&row.source),
+        status: status_code(&row.status),
+        cf_zone_id: row.cf_zone_id.clone().unwrap_or_default(),
+        challenge_target: row.challenge_target.clone(),
+        expires_at: row.expires_at.unwrap_or(0),
+        auto_renew: row.auto_renew,
+        last_error: row.last_error.clone().unwrap_or_default(),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        has_vhost: row.has_vhost,
+        ..Default::default()
+    }
+}
+
+/// The inverse of `status_code`, for filtering `ListDomains` by the proto
+/// enum a caller sent in.
+fn status_db_value(status: DomainStatus) -> &'static str {
+    match status {
+        DomainStatus::PendingPayment => "pending_payment",
+        DomainStatus::Registering => "registering",
+        DomainStatus::ProvisioningDns => "provisioning_dns",
+        DomainStatus::PendingDns => "pending_dns",
+        DomainStatus::Issuing => "issuing",
+        DomainStatus::Active => "active",
+        DomainStatus::Renewing => "renewing",
+        DomainStatus::Error => "error",
+        DomainStatus::Removed => "removed",
+        DomainStatus::Unspecified => "",
+    }
+}
+
+fn member_status_code(status: &str) -> i32 {
+    match status {
+        "pending" => MemberStatus::Pending as i32,
+        "accepted" => MemberStatus::Accepted as i32,
+        "removed" => MemberStatus::Removed as i32,
+        _ => MemberStatus::Unspecified as i32,
+    }
+}
+
+fn order_state_code(state: &str) -> i32 {
+    match state {
+        "awaiting_payment" => OrderState::AwaitingPayment as i32,
+        "paid" => OrderState::Paid as i32,
+        "registering" => OrderState::Registering as i32,
+        "completed" => OrderState::Completed as i32,
+        "refunded" => OrderState::Refunded as i32,
+        "failed" => OrderState::Failed as i32,
+        "needs_admin" => OrderState::NeedsAdmin as i32,
+        _ => OrderState::Unspecified as i32,
+    }
+}
+
+fn order_response(row: orders_db::OrderRow) -> Order {
+    Order {
+        id: row.id.to_string(),
+        fqdn: row.fqdn,
+        organization_id: row.organization_id,
+        user_id: row.user_id,
+        cost: Some(Money { amount_cents: row.cost_cents, currency: row.currency.clone() }),
+        price: Some(Money { amount_cents: row.price_cents, currency: row.currency }),
+        state: order_state_code(&row.state),
+        cf_workflow_state: row.cf_workflow_state.unwrap_or_default(),
+        stripe_payment_intent_id: row.stripe_payment_intent_id.unwrap_or_default(),
+        domain_id: row.domain_id.map(|id| id.to_string()).unwrap_or_default(),
+        last_error: row.last_error.unwrap_or_default(),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }
+}
+
+/// A Cloudflare search/check result to this service's own `DomainOffer`,
+/// collapsing every reason a name isn't sellable (Cloudflare says taken,
+/// the TLD isn't one we sell, pricing is missing or unparseable, or it
+/// would exceed our own price cap) to the same `registrable: false` shape
+/// -- see `search_domains`'s own doc comment for why that collapsing
+/// matters.
+fn domain_offer(availability: crate::cloudflare::registrar::DomainAvailability, pricing: &crate::config::Pricing) -> DomainOffer {
+    let tier = availability.tier.clone().unwrap_or_default();
+    let unsellable = |reason: &str| DomainOffer {
+        fqdn: availability.name.clone(),
+        registrable: false,
+        reason: reason.to_owned(),
+        tier: tier.clone(),
+        price: None,
+    };
+
+    if !availability.registrable {
+        return unsellable("");
+    }
+    if !purchasing::tld_allowed(&availability.name, pricing) {
+        return unsellable("not a supported extension");
+    }
+    let Some(cf_pricing) = &availability.pricing else {
+        return unsellable("no pricing available");
+    };
+    let Ok(cost_cents) = cf_pricing.registration_cost_cents() else {
+        return unsellable("pricing unavailable");
+    };
+    match purchasing::price_for(cost_cents, pricing) {
+        Ok(price_cents) => DomainOffer {
+            fqdn: availability.name,
+            registrable: true,
+            reason: String::new(),
+            tier,
+            price: Some(Money { amount_cents: price_cents, currency: pricing.currency.clone() }),
+        },
+        Err(_) => unsellable("price exceeds platform limit"),
+    }
+}
+
 #[tonic::async_trait]
 impl DomainService for Domains {
     // --- purchasing (phase 3) -------------------------------------------
 
+    /// AUTHZ: Action::Read on ResourceType::Domain. Searching the registry
+    /// for an unregistered name is not tenant data, so this is deliberately
+    /// open to any authenticated caller -- but whatever shape the result
+    /// takes, it must never reveal that *another* organization already owns
+    /// a name. Collapsed to `registrable: false` here for every reason a
+    /// name isn't sellable (Cloudflare says taken, the TLD isn't one we
+    /// sell, or the price would exceed our own cap) -- one signal, not
+    /// three, so a caller can never distinguish "not available" from "not
+    /// for sale here."
     async fn search_domains(
         &self,
-        _request: Request<SearchRequest>,
+        request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
-        // AUTHZ: Action::Read on ResourceType::Domain. Searching the registry
-        // for an unregistered name is not tenant data and may end up needing no
-        // scope at all -- but whatever shape it takes, a result set must never
-        // reveal that *another* organization already owns a name. Say "taken",
-        // never by whom.
-        Err(pending("phase 3", "domain search"))
+        let req = request.into_inner();
+        self.caller(&req.access_token).await?;
+
+        let cf = crate::cloudflare::CfSuite::new(&self.config, &self.secrets).map_err(Status::from)?;
+        let limit = if req.limit <= 0 { 5 } else { req.limit.min(20) } as u32;
+        let candidates = crate::cloudflare::registrar::search(&cf.registrar, &cf.account_id, &req.query, limit)
+            .await
+            .map_err(Status::from)?;
+
+        let offers = candidates.into_iter().map(|c| domain_offer(c, &self.config.pricing)).collect();
+        Ok(Response::new(SearchResponse { offers }))
     }
 
+    /// AUTHZ: Action::Read on ResourceType::Domain, scoped to the caller's
+    /// own organization -- a quote is the only price a purchase may be
+    /// built on, so it is also the first place a caller could be shown
+    /// someone else's negotiated cost. `markup_percent` is applied here,
+    /// server-side, never trusted from the caller.
     async fn quote_domain(
         &self,
-        _request: Request<QuoteRequest>,
+        request: Request<QuoteRequest>,
     ) -> Result<Response<QuoteResponse>, Status> {
-        // AUTHZ: Action::Read on ResourceType::Domain, scoped to the caller's
-        // own organization. A quote is the only price a purchase may be built
-        // on, so it is also the first place a caller could be shown someone
-        // else's negotiated cost -- keep `markup_percent` application on this
-        // side of the wire.
-        Err(pending("phase 3", "domain quotes"))
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+        let organization_id = authz::real_org(&claims.organization_id)
+            .ok_or_else(|| Status::permission_denied("caller has no organization to quote for"))?
+            .to_owned();
+
+        if !purchasing::tld_allowed(&req.fqdn, &self.config.pricing) {
+            return Err(Status::invalid_argument(format!("{}: this extension is not sold here", req.fqdn)));
+        }
+
+        let cf = crate::cloudflare::CfSuite::new(&self.config, &self.secrets).map_err(Status::from)?;
+        let mut availability =
+            crate::cloudflare::registrar::check(&cf.registrar, &cf.account_id, &[req.fqdn.clone()])
+                .await
+                .map_err(Status::from)?;
+        let entry = availability
+            .pop()
+            .ok_or_else(|| Status::internal("cloudflare returned no availability information"))?;
+        if !entry.registrable {
+            return Err(Status::failed_precondition(format!("{} is not registrable", req.fqdn)));
+        }
+        let cf_pricing = entry
+            .pricing
+            .ok_or_else(|| Status::internal("cloudflare reported no pricing for a registrable domain"))?;
+        let cost_cents = cf_pricing.registration_cost_cents().map_err(Status::from)?;
+        let price_cents = purchasing::price_for(cost_cents, &self.config.pricing).map_err(Status::from)?;
+
+        let quote_id = uuid::Uuid::new_v4().to_string();
+        let expires_at = chrono::Utc::now().timestamp() + self.config.pricing.quote_ttl_secs;
+        let tier = entry.tier.clone().unwrap_or_default();
+
+        orders_db::insert_quote(
+            &self.pool,
+            &quote_id,
+            &req.fqdn,
+            &organization_id,
+            &claims.sub,
+            cost_cents,
+            price_cents,
+            &self.config.pricing.currency,
+            &tier,
+            expires_at,
+        )
+        .await
+        .map_err(Status::from)?;
+
+        Ok(Response::new(QuoteResponse {
+            quote_id,
+            offer: Some(DomainOffer {
+                fqdn: req.fqdn,
+                registrable: true,
+                reason: String::new(),
+                tier,
+                price: Some(Money { amount_cents: price_cents, currency: self.config.pricing.currency.clone() }),
+            }),
+            expires_at,
+        }))
     }
 
+    /// AUTHZ: Action::Purchase on ResourceType::Domain **and** an elevated
+    /// token (`self.elevated`), not merely a role check -- this is the one
+    /// action in this service that spends an organization's money, and the
+    /// GLOBAL policy seed gives `purchase` to Admin and Super only. Charge
+    /// the caller's own organization; never an org id taken from the
+    /// request, unless the caller is Super acting on another org's behalf.
+    /// Also gated on `Billing::organization_permits_new_purchases` (fail
+    /// closed): a suspended org, or a Billing that can't be reached to ask,
+    /// refuses the purchase outright rather than risk letting a delinquent
+    /// account keep spending.
     async fn create_order(
         &self,
-        _request: Request<CreateOrderRequest>,
+        request: Request<CreateOrderRequest>,
     ) -> Result<Response<OrderCheckout>, Status> {
-        // AUTHZ: Action::Purchase on ResourceType::Domain **and** an elevated
-        // token (`self.elevated`), not merely a role check -- this is the one
-        // action in this service that spends an organization's money, and the
-        // GLOBAL policy seed gives `purchase` to Admin and Super only. Charge
-        // the caller's own organization; never an org id taken from the
-        // request.
-        Err(pending("phase 3", "domain orders"))
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+        self.elevated(&req.elevated_token, &claims).await?;
+
+        if !self.config.purchasing.enabled {
+            return Err(Status::failed_precondition("domain purchasing is not enabled"));
+        }
+
+        let allowed = self
+            .auth
+            .evaluate_access(&claims, ResourceType::Domain, "", Action::Purchase)
+            .await
+            .map_err(Status::from)?;
+        if !allowed && claims.role != Role::Super {
+            return Err(Status::permission_denied("not permitted to purchase domains"));
+        }
+
+        let caller_org = authz::real_org(&claims.organization_id)
+            .ok_or_else(|| Status::permission_denied("caller has no organization to charge"))?
+            .to_owned();
+        if claims.role != Role::Super && !req.organization_id.is_empty() && req.organization_id != caller_org {
+            return Err(Status::permission_denied("cannot create an order for another organization"));
+        }
+        let charge_org =
+            if claims.role == Role::Super && !req.organization_id.is_empty() { req.organization_id } else { caller_org };
+
+        // Fail closed: a purchase-shaped action refuses outright if Billing
+        // can't even be asked whether this org is in good standing, rather
+        // than assuming "fine" and letting a suspended (or unreachable-to-check)
+        // org keep buying domains. This is the billing overhaul's stated
+        // policy for *new*-purchase-shaped actions specifically -- an
+        // already-registered domain is never touched by this check, only
+        // whether a *new* one may be bought.
+        let billing_ok = self.billing.organization_permits_new_purchases(&charge_org).await.map_err(Status::from)?;
+        if !billing_ok {
+            return Err(Status::failed_precondition("organization billing is not in good standing"));
+        }
+
+        let quote = orders_db::find_quote(&self.pool, &req.quote_id)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found("no such quote"))?;
+        if quote.expires_at <= chrono::Utc::now().timestamp() {
+            return Err(Status::failed_precondition("quote has expired; request a new one"));
+        }
+        if quote.organization_id != charge_org {
+            return Err(Status::permission_denied("this quote does not belong to this organization"));
+        }
+
+        let within_caps = purchasing::under_caps(&self.pool, &charge_org, quote.price_cents, &self.config.purchasing)
+            .await
+            .map_err(Status::from)?;
+        if !within_caps {
+            return Err(Status::resource_exhausted("purchasing cap reached for this organization"));
+        }
+
+        let order_id = orders_db::insert_order(
+            &self.pool,
+            &quote.fqdn,
+            &charge_org,
+            &claims.sub,
+            &req.quote_id,
+            quote.cost_cents,
+            quote.price_cents,
+            &quote.currency,
+            &req.runner_id,
+            &req.invite_email,
+        )
+        .await
+        .map_err(Status::from)?;
+
+        let payment_intent = self
+            .billing
+            .create_payment_intent(
+                "domain_management",
+                &order_id.to_string(),
+                quote.price_cents,
+                &quote.currency.to_lowercase(),
+                &[("fqdn", quote.fqdn.as_str()), ("organization_id", charge_org.as_str())],
+            )
+            .await
+            .map_err(Status::from)?;
+
+        orders_db::set_payment_intent(&self.pool, order_id, &payment_intent.stripe_payment_intent_id)
+            .await
+            .map_err(Status::from)?;
+
+        let order = orders_db::find_order(&self.pool, order_id)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::internal("order vanished mid-create"))?;
+
+        log!(LogLevel::Info, "{}: order {} created ({}c)", order.fqdn, order_id, order.price_cents);
+
+        Ok(Response::new(OrderCheckout {
+            order: Some(order_response(order)),
+            stripe_client_secret: payment_intent.client_secret,
+            stripe_publishable_key: payment_intent.publishable_key,
+        }))
     }
 
-    async fn get_order(&self, _request: Request<GetOrderRequest>) -> Result<Response<Order>, Status> {
-        // AUTHZ: Action::Read on ResourceType::Domain, and the order's owning
-        // organization must match `authz::scope` -- an order id is guessable,
-        // so "knows the id" cannot be the check.
-        Err(pending("phase 3", "domain orders"))
+    /// AUTHZ: Action::Read on ResourceType::Domain, and the order's owning
+    /// organization must match the caller's own -- an order id is
+    /// guessable, so "knows the id" cannot be the check.
+    async fn get_order(&self, request: Request<GetOrderRequest>) -> Result<Response<Order>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+        let order_id: u64 =
+            req.order_id.parse().map_err(|_| Status::invalid_argument("order_id must be numeric"))?;
+
+        let order = orders_db::find_order(&self.pool, order_id)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found("no such order"))?;
+
+        if claims.role != Role::Super {
+            let caller_org = authz::real_org(&claims.organization_id)
+                .ok_or_else(|| Status::permission_denied("caller has no organization"))?;
+            if order.organization_id != caller_org {
+                return Err(Status::permission_denied("not permitted to view this order"));
+            }
+        }
+
+        Ok(Response::new(order_response(order)))
     }
 
+    /// AUTHZ: Action::Read, filtered through `authz::scope` exactly like
+    /// ListInventory -- non-Super callers only ever see their own
+    /// organization's orders, whatever organization_id they ask for.
     async fn list_orders(
         &self,
-        _request: Request<ListOrdersRequest>,
+        request: Request<ListOrdersRequest>,
     ) -> Result<Response<ListOrdersResponse>, Status> {
-        // AUTHZ: Action::Read, filtered through `authz::scope` exactly like
-        // ListInventory -- non-Super callers only ever see their own
-        // organization's orders, whatever organization_id they ask for.
-        Err(pending("phase 3", "domain orders"))
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+        let scope = authz::scope(claims.role, &claims.organization_id, &req.organization_id)?;
+
+        let limit = if req.limit <= 0 { 50 } else { req.limit.min(200) } as i64;
+        let offset = req.offset.max(0) as i64;
+
+        let rows = orders_db::list_orders(&self.pool, scope.as_deref(), limit, offset)
+            .await
+            .map_err(Status::from)?;
+
+        Ok(Response::new(ListOrdersResponse { orders: rows.into_iter().map(order_response).collect() }))
     }
 
-    /// Stripe calling in, not a user. See the AUTHZ note inside: this one is
-    /// deliberately *not* a Claims/RBAC call.
-    async fn handle_stripe_webhook(
-        &self,
-        _request: Request<StripeWebhookRequest>,
-    ) -> Result<Response<StripeWebhookResponse>, Status> {
-        // AUTHZ: **not** evaluate_access, and not a token at all. The caller is
-        // Stripe, and the only thing that authenticates it is an HMAC of the
-        // raw request body against `secrets.stripe_webhook_secret`, compared in
-        // constant time, with the timestamp checked for replay. Portal forwards
-        // the body and Stripe-Signature header untouched precisely so the
-        // signature still verifies here. A domain must never be registered
-        // because a browser said a payment succeeded.
-        Err(pending("phase 3", "Stripe webhooks"))
-    }
+    // No handle_stripe_webhook: superseded entirely by Billing's own RPC of
+    // the same shape. See billing.proto's comment on why it isn't in this
+    // service's own proto file anymore.
 
     // --- lifecycle (phase 2) --------------------------------------------
+
+    /// AUTHZ: Action::Write on ResourceType::Domain -- there is no row yet
+    /// for `authz::may_write_domain` to check ownership of, so this is the
+    /// same "may create at all" grant `create_order` checks for purchasing,
+    /// not a per-domain one. `organization_id` is always the caller's own
+    /// (`authz::real_org`), never taken from the request: a BYO domain is
+    /// claimed by whoever proves control of it, not assigned by name.
+    /// Proving that control is a second, later step -- see `VerifyDomainNow`
+    /// -- so accepting the *request* here only ever produces a domain in
+    /// `pending_dns`, never `active`.
+    async fn add_domain(
+        &self,
+        request: Request<AddDomainRequest>,
+    ) -> Result<Response<AddDomainResponse>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+
+        let organization_id = authz::real_org(&claims.organization_id)
+            .ok_or_else(|| Status::permission_denied(authz::Denial::NoOrg.message("")))?
+            .to_owned();
+
+        let allowed = self
+            .auth
+            .evaluate_access(&claims, ResourceType::Domain, "", Action::Write)
+            .await
+            .map_err(Status::from)?;
+        if !allowed && claims.role != Role::Super {
+            return Err(Status::permission_denied("not permitted to add domains"));
+        }
+
+        let fqdn = req.fqdn.trim().trim_end_matches('.').to_ascii_lowercase();
+        if fqdn.is_empty() || !fqdn.contains('.') {
+            return Err(Status::invalid_argument("fqdn does not look like a domain name"));
+        }
+        if inventory_db::find_domain(&self.pool, &fqdn).await.map_err(Status::from)?.is_some() {
+            return Err(Status::already_exists(format!("{fqdn} is already known to this service")));
+        }
+
+        if !req.runner_id.is_empty() && self.may_write_runner(&claims, &req.runner_id).await? == Some(false) {
+            return Err(Status::permission_denied("not permitted to attach to this runner"));
+        }
+
+        let ownership_token = uuid::Uuid::new_v4().to_string();
+        let challenge_target = self.config.challenge_target_for(&fqdn);
+
+        let domain_id = domains_db::insert_byo(
+            &self.pool,
+            &fqdn,
+            &organization_id,
+            &req.runner_id,
+            &ownership_token,
+            &challenge_target,
+        )
+        .await
+        .map_err(Status::from)?;
+
+        let mut required_records = vec![RequiredRecord {
+            r#type: "TXT".to_owned(),
+            name: format!("_ais-domains-verify.{fqdn}"),
+            content: ownership_token,
+            note: "proves you control this domain; create this first, then call VerifyDomainNow"
+                .to_owned(),
+        }];
+        for ip in &self.config.dns.edge_ipv4 {
+            required_records.push(RequiredRecord {
+                r#type: "A".to_owned(),
+                name: fqdn.clone(),
+                content: ip.clone(),
+                note: "points this domain at our edge".to_owned(),
+            });
+        }
+        for ip in &self.config.dns.edge_ipv6 {
+            required_records.push(RequiredRecord {
+                r#type: "AAAA".to_owned(),
+                name: fqdn.clone(),
+                content: ip.clone(),
+                note: "points this domain at our edge".to_owned(),
+            });
+        }
+        required_records.push(RequiredRecord {
+            r#type: "CNAME".to_owned(),
+            name: format!("_acme-challenge.{fqdn}"),
+            content: challenge_target,
+            note: "lets us issue and renew your certificate with no further steps".to_owned(),
+        });
+
+        let row = domains_db::find_full(&self.pool, domain_id)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::internal("domain vanished mid-create"))?;
+
+        log!(LogLevel::Info, "{fqdn}: added as BYO, awaiting ownership proof");
+
+        Ok(Response::new(AddDomainResponse { domain: Some(domain_response(&row)), required_records }))
+    }
+
+    /// AUTHZ: `authz::may_read_domain` -- an fqdn is public knowledge, so the
+    /// lookup succeeding must never be what decides visibility; only
+    /// ownership does.
+    async fn get_domain(&self, request: Request<GetDomainRequest>) -> Result<Response<Domain>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+
+        let row = domains_db::find_full_by_id_or_fqdn(&self.pool, &req.id_or_fqdn)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found(format!("no domain {}", req.id_or_fqdn)))?;
+
+        authz::may_read_domain(claims.role, &claims.organization_id, row.organization_id.as_deref())
+            .map_err(|denial| denial.into_status(&row.fqdn))?;
+
+        let certificates =
+            domains_db::certificates_for(&self.pool, row.id).await.map_err(Status::from)?;
+        let records = domains_db::managed_records_for(&self.pool, row.id).await.map_err(Status::from)?;
+
+        let mut domain = domain_response(&row);
+        domain.certificates = certificates.into_iter().map(|cert| cert_response(row.id, cert)).collect();
+        domain.records = records
+            .into_iter()
+            .map(|record| ManagedRecord {
+                purpose: match record.purpose.as_str() {
+                    "edge_a" => RecordPurpose::EdgeA as i32,
+                    "edge_aaaa" => RecordPurpose::EdgeAaaa as i32,
+                    "www" => RecordPurpose::Www as i32,
+                    "acme_alias" => RecordPurpose::AcmeAlias as i32,
+                    _ => RecordPurpose::Unspecified as i32,
+                },
+                r#type: record.record_type,
+                name: record.name,
+                content: record.content,
+                cf_record_id: record.cf_record_id.unwrap_or_default(),
+                drifted: record.drifted,
+            })
+            .collect();
+
+        Ok(Response::new(domain))
+    }
+
+    /// AUTHZ: `authz::scope`, same as `ListInventory`.
+    async fn list_domains(
+        &self,
+        request: Request<ListDomainsRequest>,
+    ) -> Result<Response<ListDomainsResponse>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+        let scope = authz::scope(claims.role, &claims.organization_id, &req.organization_id)?;
+
+        let status = DomainStatus::try_from(req.status).unwrap_or(DomainStatus::Unspecified);
+        let status_filter = match status {
+            DomainStatus::Unspecified => None,
+            other => Some(status_db_value(other)),
+        };
+
+        let limit = if req.limit <= 0 { 100 } else { req.limit as i64 };
+        let rows = domains_db::list(
+            &self.pool,
+            scope.as_deref(),
+            (!req.runner_id.is_empty()).then_some(req.runner_id.as_str()),
+            status_filter,
+            limit,
+            req.offset as i64,
+        )
+        .await
+        .map_err(Status::from)?;
+
+        Ok(Response::new(ListDomainsResponse { domains: rows.iter().map(domain_response).collect() }))
+    }
+
+    /// AUTHZ: `authz::may_write_domain` (no runner in play -- the request
+    /// names none) plus `require_domain_grant`'s `Action::Delete`, and an
+    /// elevated token: removing a domain takes a live site off the internet
+    /// and frees a name someone else can then claim, the same bar
+    /// `delete_dns_record` sits behind for a single record.
+    async fn remove_domain(
+        &self,
+        request: Request<RemoveDomainRequest>,
+    ) -> Result<Response<RemoveDomainResponse>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.elevated_token).await?;
+        if claims.kind != TokenType::Elevated {
+            return Err(Status::permission_denied("this needs an elevated token"));
+        }
+
+        let existing = inventory_db::find_domain(&self.pool, &req.id_or_fqdn)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found(format!("no domain {}", req.id_or_fqdn)))?;
+
+        authz::may_write_domain(claims.role, &claims.organization_id, existing.organization_id.as_deref(), None)
+            .map_err(|denial| denial.into_status(&existing.fqdn))?;
+        self.require_domain_grant(&claims, existing.id, Action::Delete).await?;
+
+        if req.delete_zone {
+            let zone_id = domains_db::find_full(&self.pool, existing.id)
+                .await
+                .map_err(Status::from)?
+                .and_then(|row| row.cf_zone_id)
+                .filter(|id| !id.is_empty());
+
+            if let Some(zone_id) = zone_id {
+                let cf = crate::cloudflare::CfSuite::new(&self.config, &self.secrets).map_err(Status::from)?;
+                if let Err(err) = crate::cloudflare::zones::delete(&cf.zones, &zone_id).await {
+                    log!(LogLevel::Warn, "{}: could not delete cloudflare zone {}: {}", existing.fqdn, zone_id, err);
+                }
+            }
+        }
+        // keep_registration is documentation-only, per its own proto comment:
+        // this handler never calls the registrar either way.
+
+        domains_db::soft_delete(&self.pool, existing.id).await.map_err(Status::from)?;
+        log!(LogLevel::Info, "{}: removed", existing.fqdn);
+
+        Ok(Response::new(RemoveDomainResponse { success: true }))
+    }
+
+    /// AUTHZ: `authz::may_write_domain` with no runner in play -- a probe is
+    /// read-only in itself, but success here can advance the domain's status
+    /// and even trigger issuance, so it sits at the write bar (Super, or an
+    /// Admin of the owning org), not the lighter read one.
+    async fn verify_domain_now(
+        &self,
+        request: Request<VerifyDomainRequest>,
+    ) -> Result<Response<Domain>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+
+        let existing = inventory_db::find_domain(&self.pool, &req.id_or_fqdn)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found(format!("no domain {}", req.id_or_fqdn)))?;
+        authz::may_write_domain(claims.role, &claims.organization_id, existing.organization_id.as_deref(), None)
+            .map_err(|denial| denial.into_status(&existing.fqdn))?;
+
+        let row = domains_db::find_full(&self.pool, existing.id)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::internal("domain vanished mid-verify"))?;
+
+        let probe = Probe::with_servers(&self.config.dns.resolvers).map_err(Status::from)?;
+
+        // Step one, BYO only: prove control of the name before anything else
+        // is even checked. Purchased and imported domains skip this --
+        // ownership was never in question for either.
+        if row.source == "byo" && !row.ownership_verified {
+            let Some(token) = &row.ownership_token else {
+                return Err(Status::internal(format!("{}: no ownership token on record", row.fqdn)));
+            };
+            let values = probe
+                .txt(&format!("_ais-domains-verify.{}", row.fqdn))
+                .await
+                .map_err(Status::from)?;
+
+            if !values.iter().any(|value| value == token) {
+                domains_db::set_last_error(
+                    &self.pool,
+                    row.id,
+                    Some("ownership TXT record not found yet; create it and try again"),
+                )
+                .await
+                .ok();
+                let updated = domains_db::find_full(&self.pool, row.id).await.map_err(Status::from)?.unwrap();
+                return Ok(Response::new(domain_response(&updated)));
+            }
+
+            domains_db::mark_ownership_verified(&self.pool, row.id).await.map_err(Status::from)?;
+        }
+
+        // Step two: is the domain actually pointed at us? Same checks
+        // `inventory::scan::check_dns` runs in bulk, against just this one
+        // domain, on demand.
+        let expected: Vec<std::net::IpAddr> = self
+            .config
+            .dns
+            .edge_ipv4
+            .iter()
+            .chain(self.config.dns.edge_ipv6.iter())
+            .filter_map(|ip| ip.parse().ok())
+            .collect();
+        let edge_ok = probe.resolves_to_edge(&row.fqdn, &expected).await.unwrap_or(false);
+        let cname_ok = probe.challenge_cname_ok(&row.fqdn, &row.challenge_target).await.unwrap_or(false);
+
+        if !edge_ok || !cname_ok {
+            let mut missing = Vec::new();
+            if !edge_ok {
+                missing.push("the A/AAAA record pointing at our edge");
+            }
+            if !cname_ok {
+                missing.push("the _acme-challenge CNAME");
+            }
+            domains_db::set_last_error(
+                &self.pool,
+                row.id,
+                Some(&format!("still missing: {}", missing.join(", "))),
+            )
+            .await
+            .ok();
+            let updated = domains_db::find_full(&self.pool, row.id).await.map_err(Status::from)?.unwrap();
+            return Ok(Response::new(domain_response(&updated)));
+        }
+
+        // Everything checks out. Issue (or re-issue) and go live, unless
+        // this domain is already active -- a repeated VerifyDomainNow on a
+        // healthy domain should not burn a certificate issuance every time.
+        if row.status != "active" {
+            match crate::acme::issue_and_install(&self.config, &self.secrets, &row.fqdn).await {
+                Ok(_) => {
+                    for key_type in KeyType::ALL {
+                        if let Ok(Some(not_after)) =
+                            crate::acme::install::read_expiry(&self.config, &row.fqdn, key_type)
+                        {
+                            let renew_after = not_after - self.config.acme.renew_before_days * 86_400;
+                            domains_db::record_certificate(&self.pool, row.id, key_type.as_str(), not_after, renew_after)
+                                .await
+                                .ok();
+                        }
+                    }
+                    domains_db::set_status(&self.pool, row.id, "active", None).await.map_err(Status::from)?;
+                    log!(LogLevel::Info, "{}: verified and issued", row.fqdn);
+                }
+                Err(err) => {
+                    domains_db::set_status(&self.pool, row.id, "error", Some(&err.to_string())).await.ok();
+                    return Err(err.into());
+                }
+            }
+        }
+
+        let updated = domains_db::find_full(&self.pool, row.id)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::internal("domain vanished mid-verify"))?;
+        Ok(Response::new(domain_response(&updated)))
+    }
+
+    type WatchDomainStream =
+        Pin<Box<dyn Stream<Item = Result<DomainEvent, Status>> + Send + 'static>>;
+
+    /// AUTHZ: `authz::may_read_domain` before the stream opens (a specific
+    /// `id_or_fqdn`), or `authz::scope` for "every domain I may see"
+    /// (`id_or_fqdn` empty) -- and re-checked on every poll tick, so a
+    /// domain reassigned mid-stream stops producing events for the caller
+    /// who no longer owns it rather than a long-lived stream outliving the
+    /// permission that opened it.
+    async fn watch_domain(
+        &self,
+        request: Request<WatchDomainRequest>,
+    ) -> Result<Response<Self::WatchDomainStream>, Status> {
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+
+        let only_id = if req.id_or_fqdn.is_empty() {
+            None
+        } else {
+            let existing = inventory_db::find_domain(&self.pool, &req.id_or_fqdn)
+                .await
+                .map_err(Status::from)?
+                .ok_or_else(|| Status::not_found(format!("no domain {}", req.id_or_fqdn)))?;
+            authz::may_read_domain(claims.role, &claims.organization_id, existing.organization_id.as_deref())
+                .map_err(|denial| denial.into_status(&existing.fqdn))?;
+            Some(existing.id)
+        };
+        // `None` (every organization) only for Super -- `scope` already
+        // enforces that; a non-Super caller watching "every domain" is
+        // silently narrowed to their own, same as ListInventory.
+        let scope = authz::scope(claims.role, &claims.organization_id, "")?;
+
+        let pool = self.pool.clone();
+        let role = claims.role;
+        let caller_org = claims.organization_id.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+
+        tokio::spawn(async move {
+            // Seeds `last` without emitting: a fresh stream reports changes
+            // from here forward, not the state the domain happened to
+            // already be in when the caller connected.
+            let mut last: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+            if let Ok(rows) = domains_db::poll_statuses(&pool, only_id, scope.as_deref()).await {
+                for row in rows {
+                    last.insert(row.id, row.status);
+                }
+            }
+
+            loop {
+                tokio::time::sleep(POLL_INTERVAL).await;
+
+                let rows = match domains_db::poll_statuses(&pool, only_id, scope.as_deref()).await {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        let _ = tx.send(Err(Status::from(err))).await;
+                        return;
+                    }
+                };
+
+                for row in rows {
+                    if authz::may_read_domain(role, &caller_org, row.organization_id.as_deref()).is_err() {
+                        continue;
+                    }
+
+                    let changed = last.get(&row.id).is_none_or(|previous| previous != &row.status);
+                    if !changed {
+                        continue;
+                    }
+                    last.insert(row.id, row.status.clone());
+
+                    let event = DomainEvent {
+                        domain_id: row.id.to_string(),
+                        fqdn: row.fqdn,
+                        status: status_code(&row.status),
+                        message: row.last_error.unwrap_or_default(),
+                        at: chrono::Utc::now().timestamp(),
+                    };
+                    if tx.send(Ok(event)).await.is_err() {
+                        return; // caller disconnected
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))))
+    }
+
+    // --- vhosts (phase 2) -----------------------------------------------
+
+    async fn attach_domain(
+        &self,
+        request: Request<AttachDomainRequest>,
+    ) -> Result<Response<Domain>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+
+        let existing = inventory_db::find_domain(&self.pool, &req.id_or_fqdn)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found(format!("no domain {}", req.id_or_fqdn)))?;
+
+        // Attaching points a hostname at a runner, so it takes permission on
+        // both ends: the domain record (this service's own row) and the runner
+        // the traffic will land on (ais_auth's decision). Neither the caller's
+        // role nor their membership of the owning org is sufficient by itself
+        // -- see `grpc::authz`.
+        let runner = self.may_write_runner(&claims, &req.runner_id).await?;
+        authz::may_write_domain(
+            claims.role,
+            &claims.organization_id,
+            existing.organization_id.as_deref(),
+            runner,
+        )
+        .map_err(|denial| denial.into_status(&existing.fqdn))?;
+
+        let backends = req
+            .backends
+            .into_iter()
+            .map(backend_from_proto)
+            .collect::<Result<Vec<_>, Status>>()?;
+
+        let mut spec = crate::vhost::render::VhostSpec::new(&existing.fqdn, &req.runner_id, backends);
+        spec.extra_names = req.extra_names;
+        spec.http_redirect = !req.no_http_redirect;
+        spec.extra_headers = req
+            .extra_headers
+            .into_iter()
+            .map(|h| crate::vhost::render::HeaderEntry { name: h.name, value: h.value })
+            .collect();
+        spec.cors = req.cors.map(|c| crate::vhost::render::CorsPolicy {
+            allow_origin: c.allow_origin,
+            allow_methods: c.allow_methods,
+            allow_headers: c.allow_headers,
+            expose_headers: c.expose_headers,
+        });
+        spec.extra_locations = req
+            .extra_locations
+            .into_iter()
+            .map(|l| {
+                let kind = match LocationKind::try_from(l.kind).unwrap_or(LocationKind::Unspecified) {
+                    LocationKind::Websocket => crate::vhost::render::LocationKind::Websocket,
+                    LocationKind::DenyAll => crate::vhost::render::LocationKind::DenyAll,
+                    LocationKind::Unspecified => {
+                        return Err(Status::invalid_argument(format!(
+                            "extra_locations[{}]: kind must be set",
+                            l.path
+                        )));
+                    }
+                };
+                Ok(crate::vhost::render::ExtraLocation { path: l.path, kind })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+
+        let outcome = crate::vhost::attach(&self.config, &spec).await?;
+
+        let server_names = spec.server_names();
+        inventory_db::record_generated_vhost(
+            &self.pool,
+            existing.id,
+            &req.runner_id,
+            &self
+                .config
+                .vhost_path_for(&existing.fqdn)
+                .strip_prefix(&self.config.tree.root)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            &server_names,
+        )
+        .await
+        .map_err(Status::from)?;
+
+        inventory_db::set_assignment(&self.pool, existing.id, None, Some(Some(req.runner_id)))
+            .await
+            .map_err(Status::from)?;
+
+        log!(
+            LogLevel::Info,
+            "{}: vhost {} ({} instance(s))",
+            existing.fqdn,
+            match &outcome.vhost {
+                crate::vhost::render::VhostOutcome::Created(_) => "created",
+                crate::vhost::render::VhostOutcome::Updated(_) => "updated",
+                crate::vhost::render::VhostOutcome::Unchanged(_) => "unchanged",
+                crate::vhost::render::VhostOutcome::HandWritten { .. } => "left alone (hand-written)",
+            },
+            spec.backends.len()
+        );
+
+        let updated = inventory_db::find_domain(&self.pool, &req.id_or_fqdn)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::internal("domain vanished mid-attach"))?;
+
+        Ok(Response::new(Domain {
+            id: updated.id.to_string(),
+            fqdn: updated.fqdn,
+            organization_id: updated.organization_id.unwrap_or_default(),
+            runner_id: updated.runner_id.unwrap_or_default(),
+            source: source_code(&updated.source),
+            status: status_code(&updated.status),
+            has_vhost: true,
+            ..Default::default()
+        }))
+    }
+
+    /// Read-only: stages a copy of the tree, writes the submission into it,
+    /// and runs `nginx -t` plus a lint diff. Never touches the live tree, so
+    /// this needs only a read-level check, not the write bar `attach_domain`
+    /// and `apply_freeform_vhost` sit behind.
+    async fn validate_freeform_vhost(
+        &self,
+        request: Request<ValidateFreeformVhostRequest>,
+    ) -> Result<Response<ValidateFreeformVhostResponse>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+
+        let existing = inventory_db::find_domain(&self.pool, &req.id_or_fqdn)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found(format!("no domain {}", req.id_or_fqdn)))?;
+
+        authz::may_read_domain(claims.role, &claims.organization_id, existing.organization_id.as_deref())
+            .map_err(|denial| denial.into_status(&existing.fqdn))?;
+
+        let outcome = crate::vhost::freeform::validate(&self.config, &existing.fqdn, &req.server_block)
+            .await
+            .map_err(Status::from)?;
+
+        Ok(Response::new(freeform_response(outcome)))
+    }
+
+    /// Validates, then -- if valid and not a dry run -- writes into the live
+    /// tree. This rewrites a file that may be serving live traffic, so it
+    /// sits behind the same two-ended write check as `attach_domain`, plus
+    /// an elevated token: an arbitrary, caller-supplied nginx config is a
+    /// materially bigger blast radius than a structured, validated spec.
+    async fn apply_freeform_vhost(
+        &self,
+        request: Request<ApplyFreeformVhostRequest>,
+    ) -> Result<Response<ApplyFreeformVhostResponse>, Status> {
+        let req = request.into_inner();
+        // Only one token travels with this request, and it must already be
+        // an elevated one -- there is no separate access_token to compare it
+        // against, unlike `self.elevated()`'s usual two-token shape.
+        let claims = self.caller(&req.elevated_token).await?;
+        if claims.kind != TokenType::Elevated {
+            return Err(Status::permission_denied("this needs an elevated token"));
+        }
+
+        let existing = inventory_db::find_domain(&self.pool, &req.id_or_fqdn)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found(format!("no domain {}", req.id_or_fqdn)))?;
+
+        authz::may_write_domain(claims.role, &claims.organization_id, existing.organization_id.as_deref(), None)
+            .map_err(|denial| denial.into_status(&existing.fqdn))?;
+
+        let outcome = crate::vhost::freeform::apply(&self.config, &existing.fqdn, &req.server_block, req.dry_run)
+            .await
+            .map_err(Status::from)?;
+
+        if outcome.applied {
+            self.record_freeform_apply(existing.id, &existing.fqdn, &outcome.body, &claims.sub).await?;
+            log!(LogLevel::Info, "{}: freeform vhost applied", existing.fqdn);
+        }
+
+        Ok(Response::new(ApplyFreeformVhostResponse {
+            applied: outcome.applied,
+            diff: outcome.diff,
+            validation: Some(freeform_response(outcome.validation)),
+        }))
+    }
+
+    /// AUTHZ: the same two-ended check as `attach_domain` -- `may_write_runner`
+    /// on the runner being detached from, and `authz::may_write_domain` on
+    /// the record.
+    async fn detach_domain(
+        &self,
+        request: Request<DetachDomainRequest>,
+    ) -> Result<Response<Domain>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+
+        let existing = inventory_db::find_domain(&self.pool, &req.id_or_fqdn)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found(format!("no domain {}", req.id_or_fqdn)))?;
+
+        let runner = self.may_write_runner(&claims, existing.runner_id.as_deref().unwrap_or("")).await?;
+        authz::may_write_domain(claims.role, &claims.organization_id, existing.organization_id.as_deref(), runner)
+            .map_err(|denial| denial.into_status(&existing.fqdn))?;
+
+        // Only ever remove a file this service generated -- a hand-written
+        // or freeform one is left alone with a warning, the same caution
+        // `attach_domain`/`ConvertVhost` already take with a file that is
+        // not ours to throw away.
+        match inventory_db::vhost_origin(&self.pool, existing.id).await.map_err(Status::from)? {
+            Some(origin) if origin == "generated" => {
+                let path = self.config.vhost_path_for(&existing.fqdn);
+                if let Err(err) = std::fs::remove_file(&path) {
+                    if err.kind() != std::io::ErrorKind::NotFound {
+                        return Err(Status::internal(format!(
+                            "{}: removing {}: {}",
+                            existing.fqdn,
+                            path.display(),
+                            err
+                        )));
+                    }
+                }
+                inventory_db::delete_vhost(&self.pool, existing.id).await.map_err(Status::from)?;
+            }
+            Some(origin) => log!(
+                LogLevel::Warn,
+                "{}: leaving the {} vhost file alone; detaching only clears the assignment",
+                existing.fqdn,
+                origin
+            ),
+            None => {}
+        }
+
+        inventory_db::set_assignment(&self.pool, existing.id, None, Some(None)).await.map_err(Status::from)?;
+
+        let updated = inventory_db::find_domain(&self.pool, &req.id_or_fqdn)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::internal("domain vanished mid-detach"))?;
+
+        log!(LogLevel::Info, "{}: detached", updated.fqdn);
+
+        Ok(Response::new(Domain {
+            id: updated.id.to_string(),
+            fqdn: updated.fqdn,
+            organization_id: updated.organization_id.unwrap_or_default(),
+            runner_id: updated.runner_id.unwrap_or_default(),
+            source: source_code(&updated.source),
+            status: status_code(&updated.status),
+            has_vhost: false,
+            ..Default::default()
+        }))
+    }
+
+    // --- members (phase 3) ----------------------------------------------
+
+    /// AUTHZ: `authz::may_write_domain` (no runner in play) plus
+    /// `require_domain_grant`'s `Action::Grant` -- handing someone
+    /// Cloudflare access to the account is delegating authority, which is a
+    /// grant, not a plain write. (No elevated token here: unlike
+    /// `CreateOrder`/`RemoveDomain`, `InviteDomainMemberRequest` carries only
+    /// an `access_token` -- the grant check itself is the bar.)
+    async fn invite_domain_member(
+        &self,
+        request: Request<InviteDomainMemberRequest>,
+    ) -> Result<Response<DomainMember>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+
+        let existing = inventory_db::find_domain(&self.pool, &req.id_or_fqdn)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found(format!("no domain {}", req.id_or_fqdn)))?;
+        authz::may_write_domain(claims.role, &claims.organization_id, existing.organization_id.as_deref(), None)
+            .map_err(|denial| denial.into_status(&existing.fqdn))?;
+        self.require_domain_grant(&claims, existing.id, Action::Grant).await?;
+
+        if req.email.trim().is_empty() {
+            return Err(Status::invalid_argument("email is required"));
+        }
+        let role_name = if req.role.is_empty() { &self.config.cloudflare.member_role } else { &req.role };
+
+        let cf = crate::cloudflare::CfSuite::new(&self.config, &self.secrets).map_err(Status::from)?;
+        let role_id = crate::cloudflare::members::role_id_for(&cf.members, &cf.account_id, role_name)
+            .await
+            .map_err(Status::from)?;
+        let member = crate::cloudflare::members::invite(&cf.members, &cf.account_id, &req.email, &role_id)
+            .await
+            .map_err(Status::from)?;
+
+        sqlx::query(
+            "INSERT INTO domain_members (domain_id, email, cf_member_id, role, status) VALUES (?, ?, ?, ?, ?) \
+             ON DUPLICATE KEY UPDATE cf_member_id = VALUES(cf_member_id), role = VALUES(role), \
+             status = VALUES(status)",
+        )
+        .bind(existing.id)
+        .bind(&req.email)
+        .bind(&member.id)
+        .bind(role_name)
+        .bind(&member.status)
+        .execute(&self.pool)
+        .await
+        .map_err(crate::error::Error::from)
+        .map_err(Status::from)?;
+
+        log!(LogLevel::Info, "{}: invited {} as {}", existing.fqdn, req.email, role_name);
+
+        Ok(Response::new(DomainMember {
+            domain_id: existing.id.to_string(),
+            email: req.email,
+            cf_member_id: member.id,
+            role: role_name.clone(),
+            status: member_status_code(&member.status),
+            invited_at: chrono::Utc::now().timestamp(),
+        }))
+    }
+
+    /// AUTHZ: `authz::may_read_domain` -- the member list names people's
+    /// email addresses, scoped to the owning org, never fleet-wide.
+    async fn list_domain_members(
+        &self,
+        request: Request<ListDomainMembersRequest>,
+    ) -> Result<Response<ListDomainMembersResponse>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+
+        let existing = inventory_db::find_domain(&self.pool, &req.id_or_fqdn)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found(format!("no domain {}", req.id_or_fqdn)))?;
+        authz::may_read_domain(claims.role, &claims.organization_id, existing.organization_id.as_deref())
+            .map_err(|denial| denial.into_status(&existing.fqdn))?;
+
+        let rows = sqlx::query(
+            "SELECT email, cf_member_id, role, status, UNIX_TIMESTAMP(invited_at) AS invited_at \
+             FROM domain_members WHERE domain_id = ? ORDER BY email",
+        )
+        .bind(existing.id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::error::Error::from)
+        .map_err(Status::from)?;
+
+        let members = rows
+            .into_iter()
+            .map(|row| DomainMember {
+                domain_id: existing.id.to_string(),
+                email: row.get("email"),
+                cf_member_id: row.try_get::<Option<String>, _>("cf_member_id").ok().flatten().unwrap_or_default(),
+                role: row.get("role"),
+                status: member_status_code(row.get::<String, _>("status").as_str()),
+                invited_at: row.get("invited_at"),
+            })
+            .collect();
+
+        Ok(Response::new(ListDomainMembersResponse { members }))
+    }
+
+    /// AUTHZ: `authz::may_write_domain` plus `require_domain_grant`'s
+    /// `Action::Grant`, as for the invite -- same reasoning on the missing
+    /// elevated token: `RemoveDomainMemberRequest` carries none.
+    async fn remove_domain_member(
+        &self,
+        request: Request<RemoveDomainMemberRequest>,
+    ) -> Result<Response<RemoveDomainMemberResponse>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+
+        let existing = inventory_db::find_domain(&self.pool, &req.id_or_fqdn)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found(format!("no domain {}", req.id_or_fqdn)))?;
+        authz::may_write_domain(claims.role, &claims.organization_id, existing.organization_id.as_deref(), None)
+            .map_err(|denial| denial.into_status(&existing.fqdn))?;
+        self.require_domain_grant(&claims, existing.id, Action::Grant).await?;
+
+        let row = sqlx::query("SELECT cf_member_id FROM domain_members WHERE domain_id = ? AND email = ?")
+            .bind(existing.id)
+            .bind(&req.email)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(crate::error::Error::from)
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found(format!("{} has no member {}", existing.fqdn, req.email)))?;
+
+        if let Some(cf_member_id) = row.try_get::<Option<String>, _>("cf_member_id").ok().flatten() {
+            let cf = crate::cloudflare::CfSuite::new(&self.config, &self.secrets).map_err(Status::from)?;
+            if let Err(err) = crate::cloudflare::members::remove(&cf.members, &cf.account_id, &cf_member_id).await {
+                log!(LogLevel::Warn, "{}: could not remove cloudflare member {}: {}", existing.fqdn, req.email, err);
+            }
+        }
+
+        sqlx::query("UPDATE domain_members SET status = 'removed' WHERE domain_id = ? AND email = ?")
+            .bind(existing.id)
+            .bind(&req.email)
+            .execute(&self.pool)
+            .await
+            .map_err(crate::error::Error::from)
+            .map_err(Status::from)?;
+
+        log!(LogLevel::Info, "{}: removed member {}", existing.fqdn, req.email);
 
     async fn add_domain(
         &self,
@@ -665,61 +1904,37 @@ impl DomainService for Domains {
         .await
     }
 
-    async fn get_domain(&self, _request: Request<GetDomainRequest>) -> Result<Response<Domain>, Status> {
-        // AUTHZ: Action::Read, then `authz::scope` on the row that comes back
-        // -- an fqdn is public knowledge, so the lookup succeeding must not be
-        // what decides whether the caller may see the record.
-        Err(pending("phase 2", "reading a domain"))
+    // --- dns records ------------------------------------------------------
+
+    /// Read-only, so this needs only `authz::may_read_domain` -- no grant
+    /// round trip, same reasoning as `validate_freeform_vhost`.
+    async fn list_dns_records(
+        &self,
+        request: Request<ListDnsRecordsRequest>,
+    ) -> Result<Response<ListDnsRecordsResponse>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+
+        let existing = inventory_db::find_domain(&self.pool, &req.id_or_fqdn)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found(format!("no domain {}", req.id_or_fqdn)))?;
+
+        authz::may_read_domain(claims.role, &claims.organization_id, existing.organization_id.as_deref())
+            .map_err(|denial| denial.into_status(&existing.fqdn))?;
+
+        let rows = dns_records_db::list(&self.pool, existing.id).await.map_err(Status::from)?;
+
+        Ok(Response::new(ListDnsRecordsResponse { records: rows.into_iter().map(dns_record_response).collect() }))
     }
 
-    async fn list_domains(
+    /// `Action::Write` on the owning domain -- per
+    /// `RBAC_PHASE_6_DOMAIN_PURCHASE.md` §2.1, records are authorized
+    /// through their parent domain, not a resource type of their own.
+    async fn create_dns_record(
         &self,
-        _request: Request<ListDomainsRequest>,
-    ) -> Result<Response<ListDomainsResponse>, Status> {
-        // AUTHZ: `authz::scope`, same as ListInventory.
-        Err(pending("phase 2", "listing domains"))
-    }
-
-    async fn remove_domain(
-        &self,
-        _request: Request<RemoveDomainRequest>,
-    ) -> Result<Response<RemoveDomainResponse>, Status> {
-        // AUTHZ: `authz::may_write_domain` with Action::Delete on the runner,
-        // and an elevated token: removing a domain takes a live site off the
-        // internet and frees a name someone else can then claim.
-        Err(pending("phase 2", "removing a domain"))
-    }
-
-    async fn verify_domain_now(
-        &self,
-        _request: Request<VerifyDomainRequest>,
-    ) -> Result<Response<Domain>, Status> {
-        // AUTHZ: Action::Read via `authz::may_write_domain`'s ownership half --
-        // a probe is read-only, but it is also a way to ask this service to
-        // make outbound DNS queries, so it stays scoped to the caller's own
-        // domains rather than being open to any authenticated user.
-        Err(pending("phase 2", "on-demand DNS verification"))
-    }
-
-    type WatchDomainStream =
-        Pin<Box<dyn Stream<Item = Result<DomainEvent, Status>> + Send + 'static>>;
-
-    async fn watch_domain(
-        &self,
-        _request: Request<WatchDomainRequest>,
-    ) -> Result<Response<Self::WatchDomainStream>, Status> {
-        // AUTHZ: Action::Read on the domain before the stream opens, and again
-        // if the domain is reassigned mid-stream -- a long-lived stream must not
-        // outlive the permission that opened it.
-        Err(pending("phase 2", "domain event streaming"))
-    }
-
-    // --- vhosts (phase 2) -----------------------------------------------
-
-    async fn attach_domain(
-        &self,
-        request: Request<AttachDomainRequest>,
-    ) -> Result<Response<Domain>, Status> {
+        request: Request<CreateDnsRecordRequest>,
+    ) -> Result<Response<CreateDnsRecordResponse>, Status> {
         let req = request.into_inner();
         let claims = self.caller(&req.access_token).await?;
 
@@ -751,62 +1966,97 @@ impl DomainService for Domains {
         )
         .await?;
 
-        let updated = inventory_db::find_domain(&self.pool, &req.id_or_fqdn)
+        let record_id: u64 =
+            req.id.parse().map_err(|_| Status::invalid_argument("id must be this service's numeric record id"))?;
+        let current = dns_records_db::find(&self.pool, existing.id, record_id)
             .await
             .map_err(Status::from)?
-            .ok_or_else(|| Status::internal("domain vanished mid-attach"))?;
+            .ok_or_else(|| Status::not_found("no such DNS record on this domain"))?;
 
-        Ok(Response::new(Domain {
-            id: updated.id.to_string(),
-            fqdn: updated.fqdn,
-            organization_id: updated.organization_id.unwrap_or_default(),
-            runner_id: updated.runner_id.unwrap_or_default(),
-            source: source_code(&updated.source),
-            status: status_code(&updated.status),
-            has_vhost: true,
-            ..Default::default()
+        let record = req.record.ok_or_else(|| Status::invalid_argument("record is required"))?;
+        let zone_id = dns_records_db::zone_id_for(&self.pool, existing.id)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::failed_precondition(format!("{}: no Cloudflare zone", existing.fqdn)))?;
+
+        let cf = crate::cloudflare::CfSuite::new(&self.config, &self.secrets).map_err(Status::from)?;
+        let ttl = record.ttl.max(1);
+        let updated = crate::cloudflare::dns::update(
+            &cf.zones,
+            &zone_id,
+            &current.cf_record_id,
+            &record.r#type,
+            &record.name,
+            &record.content,
+            ttl,
+            Some(record.proxied),
+        )
+        .await
+        .map_err(Status::from)?;
+
+        dns_records_db::record_updated(
+            &self.pool,
+            record_id,
+            &updated.record_type,
+            &updated.name,
+            &updated.content,
+            ttl,
+            record.proxied,
+        )
+        .await
+        .map_err(Status::from)?;
+
+        Ok(Response::new(UpdateDnsRecordResponse {
+            record: Some(DnsRecordEntry {
+                id: req.id,
+                cf_record_id: updated.id,
+                r#type: updated.record_type,
+                name: updated.name,
+                content: updated.content,
+                ttl,
+                proxied: record.proxied,
+            }),
         }))
     }
 
-    async fn detach_domain(
+    /// `Action::Delete` plus an elevated token -- deleting a record can
+    /// take a live site down, the same bar `remove_domain` sits behind.
+    async fn delete_dns_record(
         &self,
-        _request: Request<DetachDomainRequest>,
-    ) -> Result<Response<Domain>, Status> {
-        // AUTHZ: the same two-ended check as attach_domain -- `may_write_runner`
-        // on the runner being detached from, and `authz::may_write_domain` on
-        // the record.
-        Err(pending("phase 2", "detaching a domain"))
-    }
+        request: Request<DeleteDnsRecordRequest>,
+    ) -> Result<Response<DeleteDnsRecordResponse>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.elevated_token).await?;
+        if claims.kind != TokenType::Elevated {
+            return Err(Status::permission_denied("this needs an elevated token"));
+        }
 
-    // --- members (phase 3) ----------------------------------------------
+        let existing = inventory_db::find_domain(&self.pool, &req.id_or_fqdn)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found(format!("no domain {}", req.id_or_fqdn)))?;
 
-    async fn invite_domain_member(
-        &self,
-        _request: Request<InviteDomainMemberRequest>,
-    ) -> Result<Response<DomainMember>, Status> {
-        // AUTHZ: Action::Grant on ResourceType::Domain -- handing someone
-        // Cloudflare access to a zone is delegating authority over it, which is
-        // a grant, not a write. Elevated token, and only ever for a zone the
-        // caller's own organization owns.
-        Err(pending("phase 3", "Cloudflare zone invites"))
-    }
+        authz::may_write_domain(claims.role, &claims.organization_id, existing.organization_id.as_deref(), None)
+            .map_err(|denial| denial.into_status(&existing.fqdn))?;
+        self.require_domain_grant(&claims, existing.id, Action::Delete).await?;
 
-    async fn list_domain_members(
-        &self,
-        _request: Request<ListDomainMembersRequest>,
-    ) -> Result<Response<ListDomainMembersResponse>, Status> {
-        // AUTHZ: Action::Read on the owning domain. The member list is a list
-        // of people's email addresses -- scoped to the owning org, never fleet
-        // -wide.
-        Err(pending("phase 3", "Cloudflare zone invites"))
-    }
+        let record_id: u64 =
+            req.id.parse().map_err(|_| Status::invalid_argument("id must be this service's numeric record id"))?;
+        let current = dns_records_db::find(&self.pool, existing.id, record_id)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found("no such DNS record on this domain"))?;
 
-    async fn remove_domain_member(
-        &self,
-        _request: Request<RemoveDomainMemberRequest>,
-    ) -> Result<Response<RemoveDomainMemberResponse>, Status> {
-        // AUTHZ: Action::Grant on the owning domain, as for the invite.
-        Err(pending("phase 3", "Cloudflare zone invites"))
+        let zone_id = dns_records_db::zone_id_for(&self.pool, existing.id)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::failed_precondition(format!("{}: no Cloudflare zone", existing.fqdn)))?;
+
+        let cf = crate::cloudflare::CfSuite::new(&self.config, &self.secrets).map_err(Status::from)?;
+        crate::cloudflare::dns::delete(&cf.zones, &zone_id, &current.cf_record_id).await.map_err(Status::from)?;
+        dns_records_db::delete(&self.pool, record_id).await.map_err(Status::from)?;
+
+        Ok(Response::new(DeleteDnsRecordResponse { success: true }))
     }
 
     // --- adoption and attachment ----------------------------------------
@@ -1068,69 +2318,219 @@ impl DomainService for Domains {
         }))
     }
 
+    /// Brings a hand-written, currently-untracked vhost under this
+    /// service's tracking. `template = "structured"` would recognize it as a
+    /// [`crate::vhost::render::VhostSpec`] and re-render it -- that
+    /// heuristic recognizer is not built yet, so only the freeform path
+    /// (the common case) is implemented: the file's exact existing text is
+    /// run through the same validate/apply pipeline as
+    /// `ApplyFreeformVhost`, changing only its tracking, not its directives.
     async fn convert_vhost(
         &self,
-        _request: Request<ConvertVhostRequest>,
+        request: Request<ConvertVhostRequest>,
     ) -> Result<Response<ConvertVhostResponse>, Status> {
-        // Needs the template engine, which arrives with generated vhosts.
-        // Until then an adopted file is simply never rewritten, which is the
-        // safe half of the behaviour anyway.
-        //
-        // AUTHZ: `authz::may_write_domain` plus `may_write_runner`, as for
-        // attach_domain -- converting rewrites a file that is currently serving
-        // live traffic, so it is a write on both ends, and it must keep
-        // `VhostOutcome::HandWritten`'s refusal to clobber a hand-written file.
-        Err(pending("the vhost template work", "converting an adopted vhost"))
+        let req = request.into_inner();
+        // AUTHZ: `authz::may_write_domain` plus `may_write_runner` -- converting
+        // rewrites a file that is currently serving live traffic, so it is a
+        // write on both ends, and an elevated token for the same reason
+        // ApplyFreeformVhost needs one.
+        let claims = self.caller(&req.elevated_token).await?;
+        if claims.kind != TokenType::Elevated {
+            return Err(Status::permission_denied("this needs an elevated token"));
+        }
+
+        let existing = inventory_db::find_domain(&self.pool, &req.id_or_fqdn)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found(format!("no domain {}", req.id_or_fqdn)))?;
+
+        let runner = self.may_write_runner(&claims, existing.runner_id.as_deref().unwrap_or("")).await?;
+        authz::may_write_domain(claims.role, &claims.organization_id, existing.organization_id.as_deref(), runner)
+            .map_err(|denial| denial.into_status(&existing.fqdn))?;
+
+        if req.template == "structured" {
+            return Err(pending(
+                "the vhost template work",
+                "recognizing a hand-written vhost as a structured VhostSpec",
+            ));
+        }
+
+        let path = self.config.vhost_path_for(&existing.fqdn);
+        let current = std::fs::read_to_string(&path)
+            .map_err(|_| Status::not_found(format!("{}: no vhost file at {}", existing.fqdn, path.display())))?;
+
+        let outcome = crate::vhost::freeform::apply(&self.config, &existing.fqdn, &current, req.dry_run)
+            .await
+            .map_err(Status::from)?;
+
+        if outcome.applied {
+            self.record_freeform_apply(existing.id, &existing.fqdn, &outcome.body, &claims.sub).await?;
+            log!(LogLevel::Info, "{}: adopted vhost brought under freeform tracking", existing.fqdn);
+        }
+
+        Ok(Response::new(ConvertVhostResponse { diff: outcome.diff, converted: outcome.applied }))
     }
 
     // --- ops ------------------------------------------------------------
 
+    /// AUTHZ: `authz::scope` -- a certificate's SANs name every site it
+    /// serves, so an unscoped list is a map of the whole estate.
     async fn list_certificates(
         &self,
-        _request: Request<ListCertificatesRequest>,
+        request: Request<ListCertificatesRequest>,
     ) -> Result<Response<ListCertificatesResponse>, Status> {
-        // AUTHZ: `authz::scope` -- a certificate's SANs name every site it
-        // serves, so an unscoped list is a map of the whole estate.
-        Err(pending("phase 2", "certificate listing"))
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+        let scope = authz::scope(claims.role, &claims.organization_id, &req.organization_id)?;
+
+        let rows = domains_db::list_certificates(&self.pool, scope.as_deref(), req.expiring_within_days)
+            .await
+            .map_err(Status::from)?;
+
+        Ok(Response::new(ListCertificatesResponse {
+            certificates: rows.into_iter().map(|(domain_id, cert)| cert_response(domain_id, cert)).collect(),
+        }))
     }
 
+    /// AUTHZ: `authz::may_write_domain` with no runner in play (so: Super, or
+    /// an Admin of the owning org). A forced renewal always issues both key
+    /// types together -- the same "the pair moves as one" rule
+    /// `install::write_pair` already enforces -- so `key_type` on the
+    /// request is accepted but does not select a subset. Rate limits are per
+    /// registered domain per week and shared by every tenant on a zone, so a
+    /// cooldown independent of the caller's own `force` intent guards
+    /// against a spammed forced renewal becoming a denial of service against
+    /// everyone else's.
     async fn force_renew(
         &self,
-        _request: Request<ForceRenewRequest>,
+        request: Request<ForceRenewRequest>,
     ) -> Result<Response<ForceRenewResponse>, Status> {
-        // AUTHZ: `authz::may_write_domain` with no runner in play (so: Super, or
-        // an Admin of the owning org). Rate limits are per registered domain
-        // per week and are shared by every tenant on a zone, so an unscoped
-        // force-renew is a denial of service against everyone else's renewals.
-        Err(pending("phase 2", "forced renewal"))
+        const COOLDOWN_SECS: i64 = 3600;
+
+        let req = request.into_inner();
+        let claims = self.caller(&req.elevated_token).await?;
+        if claims.kind != TokenType::Elevated {
+            return Err(Status::permission_denied("this needs an elevated token"));
+        }
+
+        let existing = inventory_db::find_domain(&self.pool, &req.id_or_fqdn)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found(format!("no domain {}", req.id_or_fqdn)))?;
+        authz::may_write_domain(claims.role, &claims.organization_id, existing.organization_id.as_deref(), None)
+            .map_err(|denial| denial.into_status(&existing.fqdn))?;
+
+        if let Some(age) = domains_db::seconds_since_last_issuance(&self.pool, existing.id).await.map_err(Status::from)?
+        {
+            if age < COOLDOWN_SECS {
+                return Err(Status::resource_exhausted(format!(
+                    "{}: renewed {age}s ago; wait at least {COOLDOWN_SECS}s between forced renewals",
+                    existing.fqdn
+                )));
+            }
+        }
+
+        crate::acme::issue_and_install(&self.config, &self.secrets, &existing.fqdn)
+            .await
+            .map_err(Status::from)?;
+
+        for key_type in KeyType::ALL {
+            if let Ok(Some(not_after)) = crate::acme::install::read_expiry(&self.config, &existing.fqdn, key_type) {
+                let renew_after = not_after - self.config.acme.renew_before_days * 86_400;
+                domains_db::record_certificate(&self.pool, existing.id, key_type.as_str(), not_after, renew_after)
+                    .await
+                    .map_err(Status::from)?;
+            }
+        }
+
+        log!(LogLevel::Info, "{}: force-renewed", existing.fqdn);
+
+        // Synchronous, like the CLI's `issue` command -- there is no job to
+        // report an id for.
+        Ok(Response::new(ForceRenewResponse { job_id: String::new() }))
     }
 
-    async fn publish_now(
-        &self,
-        _request: Request<PublishNowRequest>,
-    ) -> Result<Response<Release>, Status> {
-        // AUTHZ: Super only, like RescanInventory. A release is the whole
-        // nginx tree -- every tenant's vhosts in one artifact -- so there is no
-        // per-org version of this action, and `publish.shadow_mode` must still
-        // be honoured.
-        Err(pending("phase 2", "on-demand publishing"))
+    /// AUTHZ: Super only, like `RescanInventory`. A release is the whole
+    /// nginx tree -- every tenant's vhosts in one artifact -- so there is no
+    /// per-org version of this action, and `publish.shadow_mode` must still
+    /// be honoured (`publish::publish` itself already does that).
+    async fn publish_now(&self, request: Request<PublishNowRequest>) -> Result<Response<Release>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.elevated_token).await?;
+        if claims.kind != TokenType::Elevated {
+            return Err(Status::permission_denied("this needs an elevated token"));
+        }
+        if claims.role != Role::Super {
+            return Err(Status::permission_denied("publishing requires a super user"));
+        }
+
+        let outcome = crate::publish::publish(&self.config, &self.secrets, req.dry_run)
+            .await
+            .map_err(Status::from)?;
+
+        let status = if req.dry_run {
+            "dry_run"
+        } else if outcome.published {
+            "published"
+        } else {
+            "staged"
+        };
+
+        releases_db::record(&self.pool, &outcome.release_id, outcome.file_count as i32, &outcome.manifest_sha256, status)
+            .await
+            .map_err(Status::from)?;
+
+        log!(LogLevel::Info, "release {}: {status} ({} file(s))", outcome.release_id, outcome.file_count);
+
+        Ok(Response::new(Release {
+            release_id: outcome.release_id,
+            file_count: outcome.file_count as i32,
+            manifest_sha256: outcome.manifest_sha256,
+            status: status.to_owned(),
+            created_at: chrono::Utc::now().timestamp(),
+        }))
     }
 
+    /// AUTHZ: Super only, for the same reason as `publish_now`.
     async fn list_releases(
         &self,
-        _request: Request<ListReleasesRequest>,
+        request: Request<ListReleasesRequest>,
     ) -> Result<Response<ListReleasesResponse>, Status> {
-        // AUTHZ: Super only, for the same reason as publish_now.
-        Err(pending("phase 2", "release listing"))
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+        if claims.role != Role::Super {
+            return Err(Status::permission_denied("listing releases requires a super user"));
+        }
+
+        let limit = if req.limit <= 0 { 50 } else { req.limit as i64 };
+        let rows = releases_db::list(&self.pool, limit).await.map_err(Status::from)?;
+
+        Ok(Response::new(ListReleasesResponse {
+            releases: rows
+                .into_iter()
+                .map(|row| Release {
+                    release_id: row.release_id,
+                    file_count: row.file_count,
+                    manifest_sha256: row.manifest_sha256.unwrap_or_default(),
+                    status: row.status,
+                    created_at: row.created_at,
+                })
+                .collect(),
+        }))
     }
 }
 
-/// The stubbed RPCs are a deliberate, documented state -- not an oversight.
+/// What's left of Phase 6's stub-tracking tests, now that Phase 7 landed
+/// every RPC that used to be tracked here (see the crate's rollout plan).
 ///
-/// These tests exist so that stays true: the first one fails if a stub grows a
-/// body without its authorization check being written (RBAC Phase 6's whole
-/// point), and the second fails the moment a stub starts answering, forcing
-/// whoever implements it to come back and state what it now does.
+/// `the_unimplemented_rpcs_say_so_rather_than_answering` -- the test that
+/// asserted a whole list of RPCs still answered `unimplemented` -- is gone
+/// per that plan's own Phase 8 note ("delete when done, not patch the
+/// count"): there is nothing left in `DomainService` for it to track.
+/// `every_stub_documents_its_authorization` survives in a smaller form: one
+/// `pending()` call site remains (`convert_vhost`'s `template == "structured"`
+/// branch, a real, still-unbuilt feature, not a placeholder for an RPC that
+/// doesn't exist yet), and it still deserves its own AUTHZ note.
 #[cfg(test)]
 mod authorization_contracts {
     use super::*;
@@ -1172,7 +2572,10 @@ mod authorization_contracts {
             }
         }
 
-        assert!(call_sites >= 20, "expected the stubs to still be here, found {call_sites}");
+        // Just `convert_vhost`'s "structured" branch now that Phase 7 landed
+        // every RPC-level stub -- update this the moment that lands too,
+        // rather than letting it drift from reality.
+        assert_eq!(call_sites, 1, "expected exactly convert_vhost's remaining pending() call, found {call_sites}");
         assert!(
             undocumented.is_empty(),
             "these stubs do not say what authorization they will need:\n{}",
@@ -1181,9 +2584,10 @@ mod authorization_contracts {
     }
 
     fn service() -> Domains {
-        // Nothing here touches the database or ais_auth: every stub returns
-        // before it reads `self`. A lazy pool and an unreachable auth address
-        // are therefore enough, and keep this a unit test.
+        // Nothing here touches the database or ais_auth: every RPC below
+        // rejects an empty token before reading anything else. A lazy pool
+        // and an unreachable auth address are therefore enough, and keep
+        // this a unit test.
         let secrets = Secrets::load(Some(Path::new("/nonexistent/ais_domains.env")))
             .expect("a missing env file is not fatal");
         let pool = sqlx::MySqlPool::connect_lazy("mysql://unused:unused@127.0.0.1:1/unused")
@@ -1269,14 +2673,78 @@ mod authorization_contracts {
             .expect("no token is not a valid request");
         assert_eq!(status.code(), Code::Unauthenticated, "{}", status.message());
 
-        let status = service
-            .add_domain(Request::new(AddDomainRequest {
-                fqdn: "staging.example.com".to_owned(),
-                ..Default::default()
-            }))
-            .await
-            .err()
-            .expect("no token is not a valid request");
-        assert_eq!(status.code(), Code::Unauthenticated, "{}", status.message());
+        for (name, status) in [
+            (
+                "validate_freeform_vhost",
+                service
+                    .validate_freeform_vhost(Request::new(ValidateFreeformVhostRequest::default()))
+                    .await
+                    .err(),
+            ),
+            (
+                "apply_freeform_vhost",
+                service
+                    .apply_freeform_vhost(Request::new(ApplyFreeformVhostRequest::default()))
+                    .await
+                    .err(),
+            ),
+            ("convert_vhost", service.convert_vhost(Request::new(ConvertVhostRequest::default())).await.err()),
+            (
+                "list_dns_records",
+                service.list_dns_records(Request::new(ListDnsRecordsRequest::default())).await.err(),
+            ),
+            (
+                "create_dns_record",
+                service.create_dns_record(Request::new(CreateDnsRecordRequest::default())).await.err(),
+            ),
+            (
+                "update_dns_record",
+                service.update_dns_record(Request::new(UpdateDnsRecordRequest::default())).await.err(),
+            ),
+            (
+                "delete_dns_record",
+                service.delete_dns_record(Request::new(DeleteDnsRecordRequest::default())).await.err(),
+            ),
+            ("search_domains", service.search_domains(Request::new(SearchRequest::default())).await.err()),
+            ("quote_domain", service.quote_domain(Request::new(QuoteRequest::default())).await.err()),
+            ("create_order", service.create_order(Request::new(CreateOrderRequest::default())).await.err()),
+            ("get_order", service.get_order(Request::new(GetOrderRequest::default())).await.err()),
+            ("list_orders", service.list_orders(Request::new(ListOrdersRequest::default())).await.err()),
+            ("add_domain", service.add_domain(Request::new(AddDomainRequest::default())).await.err()),
+            ("get_domain", service.get_domain(Request::new(GetDomainRequest::default())).await.err()),
+            ("list_domains", service.list_domains(Request::new(ListDomainsRequest::default())).await.err()),
+            ("remove_domain", service.remove_domain(Request::new(RemoveDomainRequest::default())).await.err()),
+            (
+                "verify_domain_now",
+                service.verify_domain_now(Request::new(VerifyDomainRequest::default())).await.err(),
+            ),
+            (
+                "watch_domain",
+                service.watch_domain(Request::new(WatchDomainRequest::default())).await.err(),
+            ),
+            ("detach_domain", service.detach_domain(Request::new(DetachDomainRequest::default())).await.err()),
+            (
+                "invite_domain_member",
+                service.invite_domain_member(Request::new(InviteDomainMemberRequest::default())).await.err(),
+            ),
+            (
+                "list_domain_members",
+                service.list_domain_members(Request::new(ListDomainMembersRequest::default())).await.err(),
+            ),
+            (
+                "remove_domain_member",
+                service.remove_domain_member(Request::new(RemoveDomainMemberRequest::default())).await.err(),
+            ),
+            (
+                "list_certificates",
+                service.list_certificates(Request::new(ListCertificatesRequest::default())).await.err(),
+            ),
+            ("force_renew", service.force_renew(Request::new(ForceRenewRequest::default())).await.err()),
+            ("publish_now", service.publish_now(Request::new(PublishNowRequest::default())).await.err()),
+            ("list_releases", service.list_releases(Request::new(ListReleasesRequest::default())).await.err()),
+        ] {
+            let status = status.unwrap_or_else(|| panic!("{name}: no token is not a valid request"));
+            assert_eq!(status.code(), Code::Unauthenticated, "{name}: {}", status.message());
+        }
     }
 }

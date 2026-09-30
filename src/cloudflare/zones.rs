@@ -60,3 +60,19 @@ pub async fn ensure(api: &Api, account_id: &str, name: &str) -> Result<Zone> {
 pub async fn nameservers(api: &Api, name: &str) -> Result<Vec<String>> {
     Ok(find(api, name).await?.map(|zone| zone.name_servers).unwrap_or_default())
 }
+
+#[derive(Debug, Deserialize)]
+struct DeletedZone {
+    #[allow(dead_code)] // the id Cloudflare echoes back; nothing here needs it
+    id: String,
+}
+
+/// Deletes a zone outright -- `RemoveDomain`'s `delete_zone` option. Not
+/// idempotent the way `ensure` is: a second call against an already-deleted
+/// zone gets Cloudflare's own "zone not found" error, which is surfaced
+/// rather than swallowed, since the caller asked for a deletion and deserves
+/// to know if there was nothing left to delete.
+pub async fn delete(api: &Api, zone_id: &str) -> Result<()> {
+    let _: DeletedZone = api.delete(&format!("zones/{zone_id}")).await?;
+    Ok(())
+}

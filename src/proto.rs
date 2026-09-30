@@ -18,3 +18,10 @@ pub mod domains {
 pub mod accounts {
     tonic::include_proto!("accounts");
 }
+
+/// The generated `billing` module -- `Billing`'s `BillingService`, client
+/// side only. Stripe integration lives there now; this service only ever
+/// calls it, per `src/billing.rs`.
+pub mod billing {
+    tonic::include_proto!("billing");
+}
