@@ -23,7 +23,8 @@ use crate::proto::billing::billing_admin_service_client::BillingAdminServiceClie
 use crate::proto::billing::billing_service_client::BillingServiceClient;
 use crate::proto::billing::{
     BillingStatus, CancelPaymentIntentRequest, CreatePaymentIntentRequest, GetOrganizationBillingStatusRequest,
-    GetPaymentIntentRequest, PaymentIntent, PaymentIntentStatus, WatchPaymentIntentRequest,
+    GetPaymentIntentRequest, PaymentIntent, PaymentIntentStatus, RefundPaymentIntentRequest,
+    RefundPaymentIntentResponse, WatchPaymentIntentRequest,
 };
 
 #[derive(Clone)]
@@ -119,7 +120,50 @@ impl BillingClient {
     pub async fn get_payment_intent(&self, id_or_reference: &str) -> Result<PaymentIntent> {
         let response = self
             .client()
-            .get_payment_intent(GetPaymentIntentRequest { id_or_reference: id_or_reference.to_owned() })
+            .get_payment_intent(GetPaymentIntentRequest {
+                id_or_reference: id_or_reference.to_owned(),
+                include_client_secret: false,
+            })
+            .await
+            .map_err(status_to_error)?
+            .into_inner();
+
+        Ok(response)
+    }
+
+    /// Like [`get_payment_intent`], but also returns the `client_secret` and
+    /// `publishable_key` so the customer can be handed the payment form for an
+    /// intent created earlier (a retried or resumed order). Billing only
+    /// honours it while the intent can still be paid; the secret is fetched
+    /// from Stripe each time, never stored.
+    pub async fn get_payment_intent_for_checkout(&self, id_or_reference: &str) -> Result<PaymentIntent> {
+        let response = self
+            .client()
+            .get_payment_intent(GetPaymentIntentRequest {
+                id_or_reference: id_or_reference.to_owned(),
+                include_client_secret: true,
+            })
+            .await
+            .map_err(status_to_error)?
+            .into_inner();
+
+        Ok(response)
+    }
+
+    /// Refunds a succeeded payment in full. Idempotent per PaymentIntent on
+    /// Billing's side, so calling this again after a crash that lost the
+    /// result is safe and returns the same refund.
+    pub async fn refund_payment_intent(
+        &self,
+        id_or_reference: &str,
+        reason: &str,
+    ) -> Result<RefundPaymentIntentResponse> {
+        let response = self
+            .client()
+            .refund_payment_intent(RefundPaymentIntentRequest {
+                id_or_reference: id_or_reference.to_owned(),
+                reason: reason.to_owned(),
+            })
             .await
             .map_err(status_to_error)?
             .into_inner();

@@ -61,6 +61,76 @@ pub struct Domains {
     billing: BillingClient,
 }
 
+/// The vhost options only `AttachDomain` exposes; `AddDomain` passes none.
+#[derive(Default)]
+struct VhostExtras {
+    extra_headers: Vec<crate::vhost::render::HeaderEntry>,
+    cors: Option<crate::vhost::render::CorsPolicy>,
+    extra_locations: Vec<crate::vhost::render::ExtraLocation>,
+}
+
+impl Domains {
+    /// The Stripe charge behind `order`, and what the browser needs to pay it.
+    /// Safe to call any number of times for the same order: Billing creates
+    /// the PaymentIntent once per `(consumer, order id)` and returns the same
+    /// one after that, but only hands out its client secret on creation -- so
+    /// a repeat asks for it again. (The stored intent id is written here too,
+    /// which also repairs an order whose first attempt died between creating
+    /// the intent and recording it.)
+    async fn checkout_for(&self, order: crate::db::orders::OrderRow) -> Result<Response<OrderCheckout>, Status> {
+        let order_ref = order.id.to_string();
+        let mut payment_intent = self
+            .billing
+            .create_payment_intent(
+                "domain_management",
+                &order_ref,
+                order.price_cents,
+                &order.currency.to_lowercase(),
+                &[("fqdn", order.fqdn.as_str()), ("organization_id", order.organization_id.as_str())],
+            )
+            .await
+            .map_err(Status::from)?;
+
+        if order.stripe_payment_intent_id.as_deref() != Some(payment_intent.stripe_payment_intent_id.as_str()) {
+            orders_db::set_payment_intent(&self.pool, order.id, &payment_intent.stripe_payment_intent_id)
+                .await
+                .map_err(Status::from)?;
+        }
+
+        if payment_intent.client_secret.is_empty() {
+            payment_intent = self
+                .billing
+                .get_payment_intent_for_checkout(&format!("domain_management:{order_ref}"))
+                .await
+                .map_err(Status::from)?;
+        }
+
+        let order = orders_db::find_order(&self.pool, order.id)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::internal("order vanished mid-checkout"))?;
+
+        Ok(Response::new(OrderCheckout {
+            order: Some(order_response(order)),
+            stripe_client_secret: payment_intent.client_secret,
+            stripe_publishable_key: payment_intent.publishable_key,
+        }))
+    }
+
+    /// A second submit of a quote that already produced an order. Still
+    /// waiting for payment: hand back the same checkout. Anything else: say
+    /// what became of it, because the quote cannot be used again.
+    async fn resume_order(&self, order: crate::db::orders::OrderRow) -> Result<Response<OrderCheckout>, Status> {
+        if order.state == "awaiting_payment" {
+            return self.checkout_for(order).await;
+        }
+        Err(Status::failed_precondition(format!(
+            "this quote already produced order {} ({}); request a new quote to try again",
+            order.id, order.state
+        )))
+    }
+}
+
 impl Domains {
     pub fn new(config: Config, secrets: Secrets, pool: MySqlPool) -> Result<Self, crate::error::Error> {
         let auth = AuthClient::new(&config.auth.grpc_addr)?;
@@ -133,6 +203,55 @@ impl Domains {
         Ok(Some(allowed))
     }
 
+    /// Records what a successful freeform apply (whether reached through
+    /// `ApplyFreeformVhost` directly or via `ConvertVhost`) wrote, so a later
+    /// re-validate/re-apply can diff against what is actually on disk.
+    async fn record_freeform_apply(
+        &self,
+        domain_id: u64,
+        fqdn: &str,
+        body: &str,
+        applied_by: &str,
+    ) -> Result<(), Status> {
+        let source_path = self
+            .config
+            .vhost_path_for(fqdn)
+            .strip_prefix(&self.config.tree.root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let sha256 = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(body.as_bytes()))
+        };
+        crate::db::freeform::record_apply(&self.pool, domain_id, &source_path, body, &sha256, Some(applied_by))
+            .await
+            .map_err(Status::from)
+    }
+
+    /// The grant-tier half of a domain-scoped write. `evaluate_access` can
+    /// only ever say yes for a `Domain` resource by way of an explicit
+    /// grant -- it cannot resolve a domain to an organization the way it
+    /// resolves a `Project` -- so this is always used *alongside*
+    /// `authz::may_write_domain`'s org-ownership half, never instead of it.
+    /// `Super` bypasses the round trip entirely, same as everywhere else.
+    async fn require_domain_grant(&self, claims: &Claims, domain_id: u64, action: Action) -> Result<(), Status> {
+        if claims.role == Role::Super {
+            return Ok(());
+        }
+
+        let allowed = self
+            .auth
+            .evaluate_access(claims, ResourceType::Domain, &domain_id.to_string(), action)
+            .await
+            .map_err(Status::from)?;
+
+        if !allowed {
+            return Err(Status::permission_denied("not permitted for this domain"));
+        }
+
+        Ok(())
+    }
+
     /// Adds a hostname under a domain we already hold.
     ///
     /// DNS is written through Cloudflare when we hold the zone, and the vhost
@@ -185,7 +304,7 @@ impl Domains {
                 .map_err(Status::from)?
                 .ok_or_else(|| Status::internal("domain vanished mid-add"))?;
             match self
-                .write_vhost(&row, &req.runner_id, req.backends.clone(), req.extra_names.clone(), req.no_http_redirect)
+                .write_vhost(&row, &req.runner_id, req.backends.clone(), req.extra_names.clone(), req.no_http_redirect, VhostExtras::default())
                 .await
             {
                 Ok(()) => {
@@ -359,23 +478,16 @@ impl Domains {
         backends: Vec<Backend>,
         extra_names: Vec<String>,
         no_http_redirect: bool,
+        extras: VhostExtras,
     ) -> Result<(), Status> {
-        let mut spec = crate::vhost::render::VhostSpec::new(
-            &existing.fqdn,
-            runner_id,
-            backends
-                .into_iter()
-                .map(|backend| crate::vhost::render::Backend {
-                    node_id: backend.node_id,
-                    // A port is a u16 on the wire's u32; anything above that
-                    // is a caller bug, not something to truncate silently.
-                    port: u16::try_from(backend.port).unwrap_or(0),
-                })
-                .collect(),
-        );
+        let backends = backends.into_iter().map(backend_from_proto).collect::<Result<Vec<_>, Status>>()?;
+        let mut spec = crate::vhost::render::VhostSpec::new(&existing.fqdn, runner_id, backends);
         spec.extra_names = extra_names;
         spec.http_redirect = !no_http_redirect;
         spec.cert_zone = self.cert_zone_for(existing);
+        spec.extra_headers = extras.extra_headers;
+        spec.cors = extras.cors;
+        spec.extra_locations = extras.extra_locations;
 
         let outcome = crate::vhost::attach(&self.config, &spec).await?;
 
@@ -824,7 +936,20 @@ impl DomainService for Domains {
             return Err(Status::resource_exhausted("purchasing cap reached for this organization"));
         }
 
-        let order_id = orders_db::insert_order(
+        // One order per quote: a double submit (a double click, a retried
+        // request) gets the order the first one made, not a second order and a
+        // second charge.
+        if let Some(existing) =
+            orders_db::find_order_by_quote(&self.pool, &req.quote_id).await.map_err(Status::from)?
+        {
+            return self.resume_order(existing).await;
+        }
+
+        if inventory_db::find_domain(&self.pool, &quote.fqdn).await.map_err(Status::from)?.is_some() {
+            return Err(Status::already_exists(format!("{} is already registered here", quote.fqdn)));
+        }
+
+        let order_id = match orders_db::insert_order_with_job(
             &self.pool,
             &quote.fqdn,
             &charge_org,
@@ -837,23 +962,21 @@ impl DomainService for Domains {
             &req.invite_email,
         )
         .await
-        .map_err(Status::from)?;
-
-        let payment_intent = self
-            .billing
-            .create_payment_intent(
-                "domain_management",
-                &order_id.to_string(),
-                quote.price_cents,
-                &quote.currency.to_lowercase(),
-                &[("fqdn", quote.fqdn.as_str()), ("organization_id", charge_org.as_str())],
-            )
-            .await
-            .map_err(Status::from)?;
-
-        orders_db::set_payment_intent(&self.pool, order_id, &payment_intent.stripe_payment_intent_id)
-            .await
-            .map_err(Status::from)?;
+        {
+            Ok(id) => id,
+            Err(err) if orders_db::is_duplicate(&err) => {
+                // Lost a race: either the same quote was submitted at the
+                // same instant, or another order is already buying this name.
+                return match orders_db::find_order_by_quote(&self.pool, &req.quote_id)
+                    .await
+                    .map_err(Status::from)?
+                {
+                    Some(existing) => self.resume_order(existing).await,
+                    None => Err(Status::already_exists(format!("{} is already being bought", quote.fqdn))),
+                };
+            }
+            Err(err) => return Err(Status::from(err)),
+        };
 
         let order = orders_db::find_order(&self.pool, order_id)
             .await
@@ -862,11 +985,7 @@ impl DomainService for Domains {
 
         log!(LogLevel::Info, "{}: order {} created ({}c)", order.fqdn, order_id, order.price_cents);
 
-        Ok(Response::new(OrderCheckout {
-            order: Some(order_response(order)),
-            stripe_client_secret: payment_intent.client_secret,
-            stripe_publishable_key: payment_intent.publishable_key,
-        }))
+        self.checkout_for(order).await
     }
 
     /// AUTHZ: Action::Read on ResourceType::Domain, and the order's owning
@@ -936,11 +1055,6 @@ impl DomainService for Domains {
     ) -> Result<Response<AddDomainResponse>, Status> {
         let req = request.into_inner();
         let claims = self.caller(&req.access_token).await?;
-
-        let organization_id = authz::real_org(&claims.organization_id)
-            .ok_or_else(|| Status::permission_denied(authz::Denial::NoOrg.message("")))?
-            .to_owned();
-
         let allowed = self
             .auth
             .evaluate_access(&claims, ResourceType::Domain, "", Action::Write)
@@ -950,70 +1064,226 @@ impl DomainService for Domains {
             return Err(Status::permission_denied("not permitted to add domains"));
         }
 
-        let fqdn = req.fqdn.trim().trim_end_matches('.').to_ascii_lowercase();
-        if fqdn.is_empty() || !fqdn.contains('.') {
-            return Err(Status::invalid_argument("fqdn does not look like a domain name"));
-        }
-        if inventory_db::find_domain(&self.pool, &fqdn).await.map_err(Status::from)?.is_some() {
-            return Err(Status::already_exists(format!("{fqdn} is already known to this service")));
+        let fqdn = crate::intake::normalize(&req.fqdn)?;
+
+        // AUTHZ: what a name *is* decides which check applies, and each is
+        // stricter than "the caller is logged in":
+        //   * already recorded  -> `authz::may_write_domain` on that record;
+        //   * under a domain we hold -> the same check on the *parent*, so a
+        //     tenant can add `staging.theirs.com` and never `x.someone-else.com`;
+        //   * already on the edge but unrecorded -> only via an owned parent, or
+        //     Super -- adopting an unowned live name is how one tenant takes
+        //     another's hostname;
+        //   * brand new -> `authz::may_add_domain`, stamped from the caller's
+        //     own claims (`authz::owner_for_new`), never from the request.
+        // The runner, if one is named, is `may_write_runner` in every case.
+        let runner = self.may_write_runner(&claims, &req.runner_id).await?;
+        let wants_vhost = !req.backends.is_empty();
+        if wants_vhost && req.runner_id.is_empty() {
+            return Err(Status::invalid_argument("instances were given but no runner_id to attach them to"));
         }
 
-        if !req.runner_id.is_empty() && self.may_write_runner(&claims, &req.runner_id).await? == Some(false) {
-            return Err(Status::permission_denied("not permitted to attach to this runner"));
+        // 1. Already ours: link, change nothing about the record.
+        if let Some(existing) = inventory_db::find_domain(&self.pool, &fqdn)
+            .await
+            .map_err(Status::from)?
+            .filter(|row| row.status != "removed")
+        {
+            authz::may_write_domain(claims.role, &claims.organization_id, existing.organization_id.as_deref(), runner)
+                .map_err(|denial| denial.into_status(&existing.fqdn))?;
+
+            if wants_vhost {
+                self.write_vhost(&existing, &req.runner_id, req.backends, req.extra_names, req.no_http_redirect, VhostExtras::default())
+                    .await?;
+            }
+            return self
+                .add_domain_response(
+                    &fqdn,
+                    AddDomainOutcome::Linked,
+                    vec![format!("{fqdn} is already recorded; nothing was changed.")],
+                    Vec::new(),
+                    wants_vhost,
+                )
+                .await;
         }
 
-        let ownership_token = uuid::Uuid::new_v4().to_string();
-        let challenge_target = self.config.challenge_target_for(&fqdn);
+        // 2. Look at the configs. Read-only, and the only way to know whether a
+        //    name someone is "adding" is in fact already being served.
+        let inventory = scan::run(&self.config, &self.secrets, &scan::ScanOptions::default())
+            .await
+            .map_err(Status::from)?;
 
-        let domain_id = domains_db::insert_byo(
+        let ancestors = crate::intake::ancestors(&fqdn);
+        let parent = inventory_db::nearest_ancestor(&self.pool, &ancestors)
+            .await
+            .map_err(Status::from)?;
+        let parent_access = match &parent {
+            Some(parent) => Some(
+                authz::may_write_domain(claims.role, &claims.organization_id, parent.organization_id.as_deref(), runner)
+                    .map_err(|denial| denial.into_status(&parent.fqdn)),
+            ),
+            None => None,
+        };
+
+        let org = authz::owner_for_new(
+            claims.role,
+            &claims.organization_id,
+            &req.organization_id,
+            parent.as_ref().and_then(|p| p.organization_id.as_deref()),
+        );
+
+        // A parent that exists on disk but was never recorded is invisible to
+        // the lookup above; without this a tenant could claim a subdomain of it.
+        let unrecorded_parent = parent.is_none()
+            && inventory.domains.iter().any(|d| ancestors.contains(&d.fqdn) || d.names.iter().any(|n| ancestors.contains(n)));
+
+        // 3. Already on the edge: record it, never rewrite it.
+        if let Some(found) = inventory.domains.iter().find(|d| d.fqdn == fqdn) {
+            match &parent_access {
+                _ if claims.role == Role::Super => {}
+                Some(Ok(())) => {}
+                Some(Err(status)) => return Err(status.clone()),
+                None => {
+                    return Err(Status::permission_denied(format!(
+                        "{fqdn} is already served from the edge but not assigned to anyone; an operator must adopt it"
+                    )));
+                }
+            }
+
+            let mut plan = crate::inventory::plan::from_inventory(&inventory, Default::default());
+            plan.domains.retain(|d| d.fqdn == found.fqdn);
+            plan.quarantine.clear();
+            for domain in &mut plan.domains {
+                domain.assign.organization_id = org.clone();
+                domain.assign.runner_id = (!req.runner_id.is_empty()).then(|| req.runner_id.clone());
+            }
+            crate::inventory::apply::apply(&self.pool, &self.config, &plan, None, &Default::default())
+                .await
+                .map_err(Status::from)?;
+
+            return self
+                .add_domain_response(
+                    &fqdn,
+                    AddDomainOutcome::Adopted,
+                    vec![format!("{fqdn} was already served from the edge's configs and is now recorded; its vhost is left as written.")],
+                    Vec::new(),
+                    false,
+                )
+                .await;
+        }
+
+        // 4. New, under a domain we hold: DNS and vhost can be ours to do.
+        if let (Some(parent), Some(access)) = (&parent, parent_access) {
+            access?;
+            return self.add_subdomain(&claims, &req, &fqdn, parent, org).await;
+        }
+        if unrecorded_parent && claims.role != Role::Super {
+            return Err(Status::permission_denied(format!(
+                "{fqdn} sits under a domain that exists on the edge but is not assigned to an organization; an operator must assign that first"
+            )));
+        }
+
+        // 5. New and unrelated to anything we hold: the customer owns the DNS.
+        //    `may_add_domain` is the role bar. A tenant then has to *prove* the
+        //    name is theirs (a TXT token, checked by VerifyDomainNow) before it
+        //    is accepted -- otherwise any org Admin could claim any unowned name.
+        //    Only Super, the operator, is trusted to add one without proof.
+        authz::may_add_domain(claims.role, &claims.organization_id)
+            .map_err(|denial| denial.into_status(&fqdn))?;
+
+        if claims.role != Role::Super {
+            let organization_id = org
+                .clone()
+                .ok_or_else(|| Status::permission_denied(authz::Denial::NoOrg.message("")))?;
+            let ownership_token = uuid::Uuid::new_v4().to_string();
+            let challenge_target = self.config.challenge_target_for(&fqdn);
+
+            let domain_id = domains_db::insert_byo(
+                &self.pool,
+                &fqdn,
+                &organization_id,
+                &req.runner_id,
+                &ownership_token,
+                &challenge_target,
+            )
+            .await
+            .map_err(Status::from)?;
+
+            let mut required_records = vec![RequiredRecord {
+                r#type: "TXT".to_owned(),
+                name: format!("_ais-domains-verify.{fqdn}"),
+                content: ownership_token,
+                note: "proves you control this domain; create this first, then call VerifyDomainNow".to_owned(),
+            }];
+            for ip in &self.config.dns.edge_ipv4 {
+                required_records.push(RequiredRecord {
+                    r#type: "A".to_owned(),
+                    name: fqdn.clone(),
+                    content: ip.clone(),
+                    note: "points this domain at our edge".to_owned(),
+                });
+            }
+            for ip in &self.config.dns.edge_ipv6 {
+                required_records.push(RequiredRecord {
+                    r#type: "AAAA".to_owned(),
+                    name: fqdn.clone(),
+                    content: ip.clone(),
+                    note: "points this domain at our edge".to_owned(),
+                });
+            }
+            required_records.push(RequiredRecord {
+                r#type: "CNAME".to_owned(),
+                name: format!("_acme-challenge.{fqdn}"),
+                content: challenge_target,
+                note: "lets us issue and renew your certificate with no further steps".to_owned(),
+            });
+
+            let row = domains_db::find_full(&self.pool, domain_id)
+                .await
+                .map_err(Status::from)?
+                .ok_or_else(|| Status::internal("domain vanished mid-create"))?;
+
+            log!(LogLevel::Info, "{fqdn}: added as BYO, awaiting ownership proof");
+
+            return Ok(Response::new(AddDomainResponse {
+                domain: Some(domain_response(&row)),
+                required_records,
+                outcome: AddDomainOutcome::NeedsDns as i32,
+                notes: vec![format!(
+                    "{fqdn} is recorded but not yet yours: create the TXT record below, then call VerifyDomainNow."
+                )],
+            }));
+        }
+
+        // Super: the operator adds it directly, no proof needed.
+        let records = crate::intake::required_records(&self.config, &fqdn, true)?;
+        inventory_db::insert_domain(
             &self.pool,
-            &fqdn,
-            &organization_id,
-            &req.runner_id,
-            &ownership_token,
-            &challenge_target,
+            &inventory_db::NewDomain {
+                fqdn: &fqdn,
+                organization_id: org.as_deref(),
+                runner_id: (!req.runner_id.is_empty()).then_some(req.runner_id.as_str()),
+                source: "byo",
+                status: "pending_dns",
+                challenge_target: &self.config.challenge_target_for(&fqdn),
+                cf_zone_id: None,
+                parent_id: None,
+                created_by: Some(&claims.sub),
+            },
         )
         .await
         .map_err(Status::from)?;
 
-        let mut required_records = vec![RequiredRecord {
-            r#type: "TXT".to_owned(),
-            name: format!("_ais-domains-verify.{fqdn}"),
-            content: ownership_token,
-            note: "proves you control this domain; create this first, then call VerifyDomainNow"
-                .to_owned(),
-        }];
-        for ip in &self.config.dns.edge_ipv4 {
-            required_records.push(RequiredRecord {
-                r#type: "A".to_owned(),
-                name: fqdn.clone(),
-                content: ip.clone(),
-                note: "points this domain at our edge".to_owned(),
-            });
-        }
-        for ip in &self.config.dns.edge_ipv6 {
-            required_records.push(RequiredRecord {
-                r#type: "AAAA".to_owned(),
-                name: fqdn.clone(),
-                content: ip.clone(),
-                note: "points this domain at our edge".to_owned(),
-            });
-        }
-        required_records.push(RequiredRecord {
-            r#type: "CNAME".to_owned(),
-            name: format!("_acme-challenge.{fqdn}"),
-            content: challenge_target,
-            note: "lets us issue and renew your certificate with no further steps".to_owned(),
-        });
-
-        let row = domains_db::find_full(&self.pool, domain_id)
-            .await
-            .map_err(Status::from)?
-            .ok_or_else(|| Status::internal("domain vanished mid-create"))?;
-
-        log!(LogLevel::Info, "{fqdn}: added as BYO, awaiting ownership proof");
-
-        Ok(Response::new(AddDomainResponse { domain: Some(domain_response(&row)), required_records }))
+        self.add_domain_response(
+            &fqdn,
+            AddDomainOutcome::NeedsDns,
+            vec![format!(
+                "{fqdn} is not under any domain we manage, so its DNS is yours to change. Create the records below and we will pick it up."
+            )],
+            records,
+            false,
+        )
+        .await
     }
 
     /// AUTHZ: `authz::may_read_domain` -- an fqdn is public knowledge, so the
@@ -1370,78 +1640,46 @@ impl DomainService for Domains {
         )
         .map_err(|denial| denial.into_status(&existing.fqdn))?;
 
-        let backends = req
-            .backends
-            .into_iter()
-            .map(backend_from_proto)
-            .collect::<Result<Vec<_>, Status>>()?;
+        let extras = VhostExtras {
+            extra_headers: req
+                .extra_headers
+                .into_iter()
+                .map(|h| crate::vhost::render::HeaderEntry { name: h.name, value: h.value })
+                .collect(),
+            cors: req.cors.map(|c| crate::vhost::render::CorsPolicy {
+                allow_origin: c.allow_origin,
+                allow_methods: c.allow_methods,
+                allow_headers: c.allow_headers,
+                expose_headers: c.expose_headers,
+            }),
+            extra_locations: req
+                .extra_locations
+                .into_iter()
+                .map(|l| {
+                    let kind = match LocationKind::try_from(l.kind).unwrap_or(LocationKind::Unspecified) {
+                        LocationKind::Websocket => crate::vhost::render::LocationKind::Websocket,
+                        LocationKind::DenyAll => crate::vhost::render::LocationKind::DenyAll,
+                        LocationKind::Unspecified => {
+                            return Err(Status::invalid_argument(format!(
+                                "extra_locations[{}]: kind must be set",
+                                l.path
+                            )));
+                        }
+                    };
+                    Ok(crate::vhost::render::ExtraLocation { path: l.path, kind })
+                })
+                .collect::<Result<Vec<_>, Status>>()?,
+        };
 
-        let mut spec = crate::vhost::render::VhostSpec::new(&existing.fqdn, &req.runner_id, backends);
-        spec.extra_names = req.extra_names;
-        spec.http_redirect = !req.no_http_redirect;
-        spec.extra_headers = req
-            .extra_headers
-            .into_iter()
-            .map(|h| crate::vhost::render::HeaderEntry { name: h.name, value: h.value })
-            .collect();
-        spec.cors = req.cors.map(|c| crate::vhost::render::CorsPolicy {
-            allow_origin: c.allow_origin,
-            allow_methods: c.allow_methods,
-            allow_headers: c.allow_headers,
-            expose_headers: c.expose_headers,
-        });
-        spec.extra_locations = req
-            .extra_locations
-            .into_iter()
-            .map(|l| {
-                let kind = match LocationKind::try_from(l.kind).unwrap_or(LocationKind::Unspecified) {
-                    LocationKind::Websocket => crate::vhost::render::LocationKind::Websocket,
-                    LocationKind::DenyAll => crate::vhost::render::LocationKind::DenyAll,
-                    LocationKind::Unspecified => {
-                        return Err(Status::invalid_argument(format!(
-                            "extra_locations[{}]: kind must be set",
-                            l.path
-                        )));
-                    }
-                };
-                Ok(crate::vhost::render::ExtraLocation { path: l.path, kind })
-            })
-            .collect::<Result<Vec<_>, Status>>()?;
-
-        let outcome = crate::vhost::attach(&self.config, &spec).await?;
-
-        let server_names = spec.server_names();
-        inventory_db::record_generated_vhost(
-            &self.pool,
-            existing.id,
+        self.write_vhost(
+            &existing,
             &req.runner_id,
-            &self
-                .config
-                .vhost_path_for(&existing.fqdn)
-                .strip_prefix(&self.config.tree.root)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            &server_names,
+            req.backends,
+            req.extra_names,
+            req.no_http_redirect,
+            extras,
         )
-        .await
-        .map_err(Status::from)?;
-
-        inventory_db::set_assignment(&self.pool, existing.id, None, Some(Some(req.runner_id)))
-            .await
-            .map_err(Status::from)?;
-
-        log!(
-            LogLevel::Info,
-            "{}: vhost {} ({} instance(s))",
-            existing.fqdn,
-            match &outcome.vhost {
-                crate::vhost::render::VhostOutcome::Created(_) => "created",
-                crate::vhost::render::VhostOutcome::Updated(_) => "updated",
-                crate::vhost::render::VhostOutcome::Unchanged(_) => "unchanged",
-                crate::vhost::render::VhostOutcome::HandWritten { .. } => "left alone (hand-written)",
-            },
-            spec.backends.len()
-        );
+        .await?;
 
         let updated = inventory_db::find_domain(&self.pool, &req.id_or_fqdn)
             .await
@@ -1744,164 +1982,7 @@ impl DomainService for Domains {
 
         log!(LogLevel::Info, "{}: removed member {}", existing.fqdn, req.email);
 
-    async fn add_domain(
-        &self,
-        request: Request<AddDomainRequest>,
-    ) -> Result<Response<AddDomainResponse>, Status> {
-        let req = request.into_inner();
-        let claims = self.caller(&req.access_token).await?;
-        let fqdn = crate::intake::normalize(&req.fqdn)?;
-
-        // AUTHZ: what a name *is* decides which check applies, and each is
-        // stricter than "the caller is logged in":
-        //   * already recorded  -> `authz::may_write_domain` on that record;
-        //   * under a domain we hold -> the same check on the *parent*, so a
-        //     tenant can add `staging.theirs.com` and never `x.someone-else.com`;
-        //   * already on the edge but unrecorded -> only via an owned parent, or
-        //     Super -- adopting an unowned live name is how one tenant takes
-        //     another's hostname;
-        //   * brand new -> `authz::may_add_domain`, stamped from the caller's
-        //     own claims (`authz::owner_for_new`), never from the request.
-        // The runner, if one is named, is `may_write_runner` in every case.
-        let runner = self.may_write_runner(&claims, &req.runner_id).await?;
-        let wants_vhost = !req.backends.is_empty();
-        if wants_vhost && req.runner_id.is_empty() {
-            return Err(Status::invalid_argument("instances were given but no runner_id to attach them to"));
-        }
-
-        // 1. Already ours: link, change nothing about the record.
-        if let Some(existing) = inventory_db::find_domain(&self.pool, &fqdn)
-            .await
-            .map_err(Status::from)?
-            .filter(|row| row.status != "removed")
-        {
-            authz::may_write_domain(claims.role, &claims.organization_id, existing.organization_id.as_deref(), runner)
-                .map_err(|denial| denial.into_status(&existing.fqdn))?;
-
-            if wants_vhost {
-                self.write_vhost(&existing, &req.runner_id, req.backends, req.extra_names, req.no_http_redirect)
-                    .await?;
-            }
-            return self
-                .add_domain_response(
-                    &fqdn,
-                    AddDomainOutcome::Linked,
-                    vec![format!("{fqdn} is already recorded; nothing was changed.")],
-                    Vec::new(),
-                    wants_vhost,
-                )
-                .await;
-        }
-
-        // 2. Look at the configs. Read-only, and the only way to know whether a
-        //    name someone is "adding" is in fact already being served.
-        let inventory = scan::run(&self.config, &self.secrets, &scan::ScanOptions::default())
-            .await
-            .map_err(Status::from)?;
-
-        let ancestors = crate::intake::ancestors(&fqdn);
-        let parent = inventory_db::nearest_ancestor(&self.pool, &ancestors)
-            .await
-            .map_err(Status::from)?;
-        let parent_access = match &parent {
-            Some(parent) => Some(
-                authz::may_write_domain(claims.role, &claims.organization_id, parent.organization_id.as_deref(), runner)
-                    .map_err(|denial| denial.into_status(&parent.fqdn)),
-            ),
-            None => None,
-        };
-
-        let org = authz::owner_for_new(
-            claims.role,
-            &claims.organization_id,
-            &req.organization_id,
-            parent.as_ref().and_then(|p| p.organization_id.as_deref()),
-        );
-
-        // A parent that exists on disk but was never recorded is invisible to
-        // the lookup above; without this a tenant could claim a subdomain of it.
-        let unrecorded_parent = parent.is_none()
-            && inventory.domains.iter().any(|d| ancestors.contains(&d.fqdn) || d.names.iter().any(|n| ancestors.contains(n)));
-
-        // 3. Already on the edge: record it, never rewrite it.
-        if let Some(found) = inventory.domains.iter().find(|d| d.fqdn == fqdn) {
-            match &parent_access {
-                _ if claims.role == Role::Super => {}
-                Some(Ok(())) => {}
-                Some(Err(status)) => return Err(status.clone()),
-                None => {
-                    return Err(Status::permission_denied(format!(
-                        "{fqdn} is already served from the edge but not assigned to anyone; an operator must adopt it"
-                    )));
-                }
-            }
-
-            let mut plan = crate::inventory::plan::from_inventory(&inventory, Default::default());
-            plan.domains.retain(|d| d.fqdn == found.fqdn);
-            plan.quarantine.clear();
-            for domain in &mut plan.domains {
-                domain.assign.organization_id = org.clone();
-                domain.assign.runner_id = (!req.runner_id.is_empty()).then(|| req.runner_id.clone());
-            }
-            crate::inventory::apply::apply(&self.pool, &self.config, &plan, None, &Default::default())
-                .await
-                .map_err(Status::from)?;
-
-            return self
-                .add_domain_response(
-                    &fqdn,
-                    AddDomainOutcome::Adopted,
-                    vec![format!("{fqdn} was already served from the edge's configs and is now recorded; its vhost is left as written.")],
-                    Vec::new(),
-                    false,
-                )
-                .await;
-        }
-
-        // 4. New, under a domain we hold: DNS and vhost can be ours to do.
-        if let (Some(parent), Some(access)) = (&parent, parent_access) {
-            access?;
-            return self.add_subdomain(&claims, &req, &fqdn, parent, org).await;
-        }
-        if unrecorded_parent && claims.role != Role::Super {
-            return Err(Status::permission_denied(format!(
-                "{fqdn} sits under a domain that exists on the edge but is not assigned to an organization; an operator must assign that first"
-            )));
-        }
-
-        // 5. New and unrelated to anything we hold: the customer owns the DNS,
-        //    so all we can do is record it and say what to create.
-        authz::may_add_domain(claims.role, &claims.organization_id)
-            .map_err(|denial| denial.into_status(&fqdn))?;
-
-        let records = crate::intake::required_records(&self.config, &fqdn, true)?;
-        inventory_db::insert_domain(
-            &self.pool,
-            &inventory_db::NewDomain {
-                fqdn: &fqdn,
-                organization_id: org.as_deref(),
-                runner_id: (!req.runner_id.is_empty()).then_some(req.runner_id.as_str()),
-                source: "byo",
-                status: "pending_dns",
-                challenge_target: &self.config.challenge_target_for(&fqdn),
-                cf_zone_id: None,
-                parent_id: None,
-                created_by: Some(&claims.sub),
-            },
-        )
-        .await
-        .map_err(Status::from)?;
-
-        self.add_domain_response(
-            &fqdn,
-            AddDomainOutcome::NeedsDns,
-            vec![format!(
-                "{fqdn} is not under any domain we manage, so its DNS is yours to change. Create the records below and we will pick it up."
-            )],
-            records,
-            false,
-        )
-        .await
+        Ok(Response::new(RemoveDomainMemberResponse { success: true }))
     }
 
     // --- dns records ------------------------------------------------------
@@ -1943,28 +2024,74 @@ impl DomainService for Domains {
             .map_err(Status::from)?
             .ok_or_else(|| Status::not_found(format!("no domain {}", req.id_or_fqdn)))?;
 
-        // Attaching points a hostname at a runner, so it takes permission on
-        // both ends: the domain record (this service's own row) and the runner
-        // the traffic will land on (ais_auth's decision). Neither the caller's
-        // role nor their membership of the owning org is sufficient by itself
-        // -- see `grpc::authz`.
-        let runner = self.may_write_runner(&claims, &req.runner_id).await?;
-        authz::may_write_domain(
-            claims.role,
-            &claims.organization_id,
-            existing.organization_id.as_deref(),
-            runner,
-        )
-        .map_err(|denial| denial.into_status(&existing.fqdn))?;
+        authz::may_write_domain(claims.role, &claims.organization_id, existing.organization_id.as_deref(), None)
+            .map_err(|denial| denial.into_status(&existing.fqdn))?;
+        self.require_domain_grant(&claims, existing.id, Action::Write).await?;
 
-        self.write_vhost(
-            &existing,
-            &req.runner_id,
-            req.backends,
-            req.extra_names,
-            req.no_http_redirect,
+        let record = req.record.ok_or_else(|| Status::invalid_argument("record is required"))?;
+        let zone_id = dns_records_db::zone_id_for(&self.pool, existing.id)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::failed_precondition(format!("{}: no Cloudflare zone yet", existing.fqdn)))?;
+
+        let cf = crate::cloudflare::CfSuite::new(&self.config, &self.secrets).map_err(Status::from)?;
+        let ttl = record.ttl.max(1);
+        let created = crate::cloudflare::dns::create(
+            &cf.zones,
+            &zone_id,
+            &record.r#type,
+            &record.name,
+            &record.content,
+            ttl,
+            Some(record.proxied),
         )
-        .await?;
+        .await
+        .map_err(Status::from)?;
+
+        let id = dns_records_db::record_created(
+            &self.pool,
+            existing.id,
+            &created.id,
+            &created.record_type,
+            &created.name,
+            &created.content,
+            ttl,
+            record.proxied,
+            Some(claims.sub.as_str()),
+        )
+        .await
+        .map_err(Status::from)?;
+
+        Ok(Response::new(CreateDnsRecordResponse {
+            record: Some(DnsRecordEntry {
+                id: id.to_string(),
+                cf_record_id: created.id,
+                r#type: created.record_type,
+                name: created.name,
+                content: created.content,
+                ttl,
+                proxied: record.proxied,
+            }),
+        }))
+    }
+
+    /// Same bar as `create_dns_record` -- `Action::Write` on the owning
+    /// domain, not a separate check per record.
+    async fn update_dns_record(
+        &self,
+        request: Request<UpdateDnsRecordRequest>,
+    ) -> Result<Response<UpdateDnsRecordResponse>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+
+        let existing = inventory_db::find_domain(&self.pool, &req.id_or_fqdn)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::not_found(format!("no domain {}", req.id_or_fqdn)))?;
+
+        authz::may_write_domain(claims.role, &claims.organization_id, existing.organization_id.as_deref(), None)
+            .map_err(|denial| denial.into_status(&existing.fqdn))?;
+        self.require_domain_grant(&claims, existing.id, Action::Write).await?;
 
         let record_id: u64 =
             req.id.parse().map_err(|_| Status::invalid_argument("id must be this service's numeric record id"))?;
@@ -2598,69 +2725,14 @@ mod authorization_contracts {
         // address is never dialled: `connect_lazy` only registers with the
         // reactor, and no test here gets far enough to make a call.
         config.auth.grpc_addr = "http://127.0.0.1:1".to_owned();
+        config.billing.grpc_addr = "http://127.0.0.1:1".to_owned();
 
         Domains::new(config, secrets, pool).expect("service")
     }
 
-    macro_rules! assert_still_a_stub {
-        ($service:expr, $method:ident, $request:ty) => {{
-            let outcome = $service.$method(Request::new(<$request>::default())).await;
-            let status = outcome.err().unwrap_or_else(|| {
-                panic!(concat!(
-                    stringify!($method),
-                    " answers now -- write its AUTHZ check (see the note above its \
-                     `pending()` call), then update this test"
-                ))
-            });
-            assert_eq!(
-                status.code(),
-                Code::Unimplemented,
-                concat!(stringify!($method), ": {}"),
-                status.message()
-            );
-            assert!(
-                !status.message().is_empty(),
-                concat!(stringify!($method), " must say which phase it lands in")
-            );
-        }};
-    }
-
-    #[tokio::test]
-    async fn the_unimplemented_rpcs_say_so_rather_than_answering() {
-        let service = service();
-
-        // Purchasing: the money path. Nothing here may work before its
-        // Action::Purchase + elevated-token check exists.
-        assert_still_a_stub!(service, search_domains, SearchRequest);
-        assert_still_a_stub!(service, quote_domain, QuoteRequest);
-        assert_still_a_stub!(service, create_order, CreateOrderRequest);
-        assert_still_a_stub!(service, get_order, GetOrderRequest);
-        assert_still_a_stub!(service, list_orders, ListOrdersRequest);
-        assert_still_a_stub!(service, handle_stripe_webhook, StripeWebhookRequest);
-
-        // Lifecycle.
-        assert_still_a_stub!(service, get_domain, GetDomainRequest);
-        assert_still_a_stub!(service, list_domains, ListDomainsRequest);
-        assert_still_a_stub!(service, remove_domain, RemoveDomainRequest);
-        assert_still_a_stub!(service, verify_domain_now, VerifyDomainRequest);
-        assert_still_a_stub!(service, watch_domain, WatchDomainRequest);
-        assert_still_a_stub!(service, detach_domain, DetachDomainRequest);
-
-        // Cloudflare account members.
-        assert_still_a_stub!(service, invite_domain_member, InviteDomainMemberRequest);
-        assert_still_a_stub!(service, list_domain_members, ListDomainMembersRequest);
-        assert_still_a_stub!(service, remove_domain_member, RemoveDomainMemberRequest);
-
-        // Vhost conversion and ops.
-        assert_still_a_stub!(service, convert_vhost, ConvertVhostRequest);
-        assert_still_a_stub!(service, list_certificates, ListCertificatesRequest);
-        assert_still_a_stub!(service, force_renew, ForceRenewRequest);
-        assert_still_a_stub!(service, publish_now, PublishNowRequest);
-        assert_still_a_stub!(service, list_releases, ListReleasesRequest);
-    }
-
-    /// An empty access token is rejected before anything else happens, on the
-    /// RPCs that *are* implemented -- the one check that must never depend on
+    /// An empty token (`access_token` or `elevated_token`, whichever the RPC
+    /// reads first) is rejected before anything else happens, on every RPC
+    /// this service implements -- the one check that must never depend on
     /// reaching ais_auth.
     #[tokio::test]
     async fn an_implemented_rpc_refuses_an_empty_token_without_calling_ais_auth() {

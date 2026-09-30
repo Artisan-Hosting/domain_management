@@ -266,6 +266,17 @@ impl Worker {
                     job.attempts,
                     err
                 );
+                // A register job that gives up after the customer has paid
+                // must not leave the order looking merely "in progress": hand
+                // it to a person, money still held.
+                if job.kind == "register" {
+                    if let Some(order_id) = job.order_id {
+                        let reason = format!("the registration job gave up after {} attempts: {err}", job.attempts);
+                        if let Err(e) = crate::db::orders::mark_needs_admin(&self.pool, order_id, &reason).await {
+                            log!(LogLevel::Error, "order {order_id}: could not flag it for an admin: {e}");
+                        }
+                    }
+                }
                 self.finish(&job, "failed", Some(err)).await;
             }
             JobOutcome::Failed(err) => {
