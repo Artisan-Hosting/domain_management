@@ -77,17 +77,17 @@ pub struct Auth {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Billing {
-    /// `https://` is mutual TLS; `http://` is plaintext (local dev only,
-    /// against a Billing run without TLS). Defaults to plaintext localhost
-    /// -- safe to boot with, and obviously not a real deployment address,
-    /// the same "safe but must be configured for production" shape
-    /// `Purchasing::enabled`'s `false` default has.
+    /// `https://` is mutual TLS (this service presents its `ais_domain`
+    /// certificate); `http://` is plaintext, for a local Billing run without
+    /// TLS only. Defaults to `https://` so a deployment that forgets to
+    /// configure this fails to connect rather than quietly sending charges
+    /// and refunds in the clear.
     pub grpc_addr: String,
 }
 
 impl Default for Billing {
     fn default() -> Self {
-        Self { grpc_addr: "http://127.0.0.1:50061".to_owned() }
+        Self { grpc_addr: "https://127.0.0.1:50061".to_owned() }
     }
 }
 
@@ -215,6 +215,14 @@ pub struct Purchasing {
     /// If the renewal charge has not cleared by this many days before expiry,
     /// stop auto-renewing and alert an admin.
     pub renewal_giveup_days_before: i64,
+    /// Registration is refused (and the customer refunded) if Cloudflare's
+    /// price at registration time is more than this many cents above the cost
+    /// the order was quoted on. The price is re-checked right before the
+    /// purchase because a registration can't be refunded once it succeeds.
+    pub max_cost_drift_cents: i64,
+    /// How long an order may wait for its payment before it is cancelled and
+    /// failed. The customer can simply quote and order again.
+    pub payment_window_secs: i64,
 }
 
 impl Default for Config {
@@ -342,6 +350,8 @@ impl Default for Purchasing {
             monthly_cap_cents: 50_000,
             renewal_charge_days_before: 30,
             renewal_giveup_days_before: 7,
+            max_cost_drift_cents: 100,
+            payment_window_secs: 3600,
         }
     }
 }
