@@ -70,6 +70,26 @@ impl Rule {
     }
 }
 
+/// Checks a customer-chosen free name and returns it lower-cased, or says why it cannot be used.
+/// This is the shape only; whether it is reserved or taken is asked separately.
+pub fn free_label(name: &str) -> std::result::Result<String, String> {
+    let label = name.trim().to_ascii_lowercase();
+    if label.len() < 3 || label.len() > 40 {
+        return Err("a name must be 3 to 40 characters".to_owned());
+    }
+    if !label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+        return Err("use only letters, numbers and hyphens".to_owned());
+    }
+    if label.starts_with('-') || label.ends_with('-') {
+        return Err("a name cannot start or end with a hyphen".to_owned());
+    }
+    // `xn--` marks an internationalised name; letting one through lets a lookalike be registered.
+    if label.contains("--") {
+        return Err("a name cannot contain two hyphens in a row".to_owned());
+    }
+    Ok(label)
+}
+
 /// The first rule that reserves `label`, if any. Case-insensitive.
 pub fn reserved_by<'a>(rules: &'a [Rule], label: &str) -> Option<&'a Rule> {
     let label = label.to_ascii_lowercase();
@@ -123,6 +143,15 @@ mod tests {
         let r = Rule::Range { prefix: "n".into(), digits: 18, min: 0, max: 10u64.pow(18) - 1 };
         assert!(r.matches("n999999999999999999"));
         assert!(!r.matches("n9999999999999999999"));
+    }
+
+    #[test]
+    fn free_labels_are_checked_for_shape() {
+        assert_eq!(free_label("  My-Shop ").as_deref(), Ok("my-shop"));
+        assert_eq!(free_label("abc").as_deref(), Ok("abc"));
+        for bad in ["ab", "", "-abc", "abc-", "a_b_c", "ab c", "xn--abc", "a--b", "dot.ted", &"a".repeat(41)] {
+            assert!(free_label(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -88,6 +88,13 @@ service DomainService {
   rpc ListReservedNames(ListReservedNamesRequest) returns (ListReservedNamesResponse);
   rpc AddReservedName(AddReservedNameRequest) returns (ReservedName);
   rpc RemoveReservedName(RemoveReservedNameRequest) returns (RemoveReservedNameResponse);
+
+  // --- free zone: addresses for customers ------------------------------
+  // `<name>.<free zone>`, first come first served, minus the reserved names. CheckFreeName is the
+  // as-you-type probe; ClaimFreeAddress records the name for the caller's organization, writes its
+  // DNS, and attaches it to the runner when backends are given.
+  rpc CheckFreeName(CheckFreeNameRequest) returns (CheckFreeNameResponse);
+  rpc ClaimFreeAddress(ClaimFreeAddressRequest) returns (AddDomainResponse);
 }
 
 // ---------------------------------------------------------------------
@@ -800,4 +807,26 @@ message RemoveReservedNameRequest {
 
 message RemoveReservedNameResponse {
   bool removed = 1;
+}
+
+message CheckFreeNameRequest {
+  string access_token = 1;
+  string name = 2;
+}
+
+message CheckFreeNameResponse {
+  bool available = 1;
+  // The normalised name, as it would be claimed.
+  string fqdn = 2;
+  // Why not, in words a customer can act on. Empty when available.
+  string reason = 3;
+}
+
+message ClaimFreeAddressRequest {
+  string access_token = 1;
+  string name = 2;
+  // The app (runner) this address is for. Required: a free address always belongs to one.
+  string runner_id = 3;
+  // Where to send traffic. Empty records the name without a vhost; AttachDomain adds it later.
+  repeated Backend backends = 4;
 }

@@ -333,6 +333,38 @@ impl Domains {
         self.add_domain_response(fqdn, outcome, notes, outstanding, vhost).await
     }
 
+    /// The free zone, or a precondition failure when the operator has not turned it on.
+    fn free_zone(&self) -> Result<String, Status> {
+        let zone = self.config.free_zone.zone.trim().to_ascii_lowercase();
+        if zone.is_empty() {
+            return Err(Status::failed_precondition("free addresses are not turned on"));
+        }
+        Ok(zone)
+    }
+
+    /// `(fqdn, why it cannot be claimed)` for a name a customer typed. Shape first, then the operator's
+    /// reservations, then whether somebody already holds it.
+    async fn free_name_problem(&self, zone: &str, name: &str) -> Result<(String, Option<String>), Status> {
+        let label = match crate::reserved::free_label(name) {
+            Ok(label) => label,
+            Err(why) => return Ok((format!("{}.{zone}", name.trim().to_ascii_lowercase()), Some(why))),
+        };
+        let fqdn = format!("{label}.{zone}");
+
+        let rules = reserved_db::rules(&self.pool).await.map_err(Status::from)?;
+        if crate::reserved::reserved_by(&rules, &label).is_some() {
+            return Ok((fqdn, Some("that name is reserved".to_owned())));
+        }
+        let taken = inventory_db::find_domain(&self.pool, &fqdn)
+            .await
+            .map_err(Status::from)?
+            .is_some_and(|row| row.status != "removed");
+        if taken {
+            return Ok((fqdn, Some("that name is already taken".to_owned())));
+        }
+        Ok((fqdn, None))
+    }
+
     /// Writes the DNS records into the zone we hold for `fqdn`, if we hold one.
     ///
     /// Returns the zone id and whether everything is now in place. Never
@@ -2498,6 +2530,67 @@ impl DomainService for Domains {
         Ok(Response::new(RemoveReservedNameResponse { removed }))
     }
 
+    async fn check_free_name(
+        &self,
+        request: Request<CheckFreeNameRequest>,
+    ) -> Result<Response<CheckFreeNameResponse>, Status> {
+        let req = request.into_inner();
+        // AUTHZ: any signed-in caller may ask; it reveals only whether a name is free, which a claim
+        // would reveal anyway.
+        self.caller(&req.access_token).await?;
+
+        let zone = self.free_zone()?;
+        let (fqdn, problem) = self.free_name_problem(&zone, &req.name).await?;
+        Ok(Response::new(CheckFreeNameResponse {
+            available: problem.is_none(),
+            fqdn,
+            reason: problem.unwrap_or_default(),
+        }))
+    }
+
+    async fn claim_free_address(
+        &self,
+        request: Request<ClaimFreeAddressRequest>,
+    ) -> Result<Response<AddDomainResponse>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+
+        // AUTHZ: the same bar as adding a domain (an org Admin, or Super), plus `ais_auth`'s decision on the
+        // runner the name is for. The owner is the caller's own organization, never taken from the request.
+        authz::may_add_domain(claims.role, &claims.organization_id).map_err(|d| d.into_status(&req.name))?;
+        if req.runner_id.is_empty() {
+            return Err(Status::invalid_argument("a free address belongs to an app: runner_id is required"));
+        }
+        let runner = self.may_write_runner(&claims, &req.runner_id).await?;
+        if runner == Some(false) {
+            return Err(Status::permission_denied("not permitted to change that app"));
+        }
+        let org = authz::real_org(&claims.organization_id)
+            .map(str::to_owned)
+            .ok_or_else(|| Status::permission_denied(authz::Denial::NoOrg.message("")))?;
+
+        let zone = self.free_zone()?;
+        let (fqdn, problem) = self.free_name_problem(&zone, &req.name).await?;
+        if let Some(reason) = problem {
+            return Err(Status::failed_precondition(reason));
+        }
+
+        // The zone is recorded (and holds the wildcard certificate) by an operator; without that row there
+        // is nothing for a free name to ride on.
+        let parent = inventory_db::find_domain(&self.pool, &zone)
+            .await
+            .map_err(Status::from)?
+            .filter(|row| row.status != "removed")
+            .ok_or_else(|| Status::failed_precondition(format!("{zone} is not set up as a managed domain yet")))?;
+
+        let add = AddDomainRequest {
+            runner_id: req.runner_id,
+            backends: req.backends,
+            ..Default::default()
+        };
+        self.add_subdomain(&claims, &add, &fqdn, &parent, Some(org)).await
+    }
+
     async fn list_adopted_vhosts(
         &self,
         request: Request<ListAdoptedVhostsRequest>,
@@ -2951,6 +3044,11 @@ mod authorization_contracts {
             (
                 "add_reserved_name",
                 service.add_reserved_name(Request::new(AddReservedNameRequest::default())).await.err(),
+            ),
+            ("check_free_name", service.check_free_name(Request::new(CheckFreeNameRequest::default())).await.err()),
+            (
+                "claim_free_address",
+                service.claim_free_address(Request::new(ClaimFreeAddressRequest::default())).await.err(),
             ),
             (
                 "remove_reserved_name",

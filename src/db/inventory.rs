@@ -7,7 +7,7 @@
 
 use sqlx::{MySqlPool, QueryBuilder, Row};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 #[derive(Debug, Clone)]
 pub struct InventoryRow {
@@ -274,7 +274,15 @@ pub async fn insert_domain(pool: &MySqlPool, new: &NewDomain<'_>) -> Result<u64>
     .bind(new.parent_id)
     .bind(new.created_by)
     .execute(pool)
-    .await?;
+    .await;
+
+    // Two people claiming the same name at once: the unique key picks the winner, the loser is told so.
+    let result = match result {
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            return Err(Error::Invalid(format!("{} is already taken", new.fqdn)));
+        }
+        other => other?,
+    };
 
     Ok(result.last_insert_id())
 }
