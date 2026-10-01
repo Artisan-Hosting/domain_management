@@ -24,6 +24,7 @@ pub mod freeform;
 pub mod inventory;
 pub mod orders;
 pub mod releases;
+pub mod reserved;
 
 use sqlx::{MySqlPool, mysql::MySqlPoolOptions};
 use std::time::Duration;
