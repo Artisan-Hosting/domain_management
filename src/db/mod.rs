@@ -45,7 +45,7 @@ pub async fn connect(database_url: &str) -> Result<MySqlPool> {
         .map_err(Error::Database)
 }
 
-pub async fn migrate(pool: &MySqlPool) -> Result<()> {
+pub async fn migrate(_pool: &MySqlPool) -> Result<()> {
     // sqlx::migrate!("./migrations").run(pool).await.map_err(Error::Migrate)
     // Stop doing migrations in software, ts isn't working
     Ok(())
