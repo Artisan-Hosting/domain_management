@@ -7,7 +7,7 @@
 
 use sqlx::{MySqlPool, QueryBuilder, Row};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 #[derive(Debug, Clone)]
 pub struct InventoryRow {
@@ -274,7 +274,15 @@ pub async fn insert_domain(pool: &MySqlPool, new: &NewDomain<'_>) -> Result<u64>
     .bind(new.parent_id)
     .bind(new.created_by)
     .execute(pool)
-    .await?;
+    .await;
+
+    // Two people claiming the same name at once: the unique key picks the winner, the loser is told so.
+    let result = match result {
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            return Err(Error::Invalid(format!("{} is already taken", new.fqdn)));
+        }
+        other => other?,
+    };
 
     Ok(result.last_insert_id())
 }
@@ -388,8 +396,10 @@ pub async fn list_findings(
     open_only: bool,
     limit: i64,
 ) -> Result<Vec<FindingRow>> {
+    // The CAST matters: COALESCE over JSON_UNQUOTE can come back typed LONGBLOB,
+    // which sqlx will not decode into a String (it panicked in row.get).
     let mut builder = QueryBuilder::new(
-        "SELECT code, severity, subject, COALESCE(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.message')), '') AS message, \
+        "SELECT code, severity, subject, CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.message')), '') AS CHAR) AS message, \
          UNIX_TIMESTAMP(first_seen) AS first_seen, UNIX_TIMESTAMP(last_seen) AS last_seen, \
          UNIX_TIMESTAMP(resolved_at) AS resolved_at \
          FROM inventory_findings WHERE 1 = 1",

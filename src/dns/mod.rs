@@ -11,3 +11,4 @@
 //!   common case and correct in the slow one.
 
 pub mod probe;
+pub mod write;

@@ -105,3 +105,27 @@ async fn validate(config: &Config, fqdn: &str) -> Result<()> {
     let stage = Stage::create(config, &format!("attach-{}", crate::config::snippet_slug(fqdn)))?;
     stage::nginx_test(config, &stage).await
 }
+
+/// Installs a vhost and records it, then points the domain at the runner.
+///
+/// The one place that does all three, shared by `AttachDomain` and the purchase worker so an attach made
+/// when a domain finishes is the same attach a person would have asked for.
+pub async fn attach_and_record(
+    config: &Config,
+    pool: &sqlx::MySqlPool,
+    domain_id: u64,
+    spec: &render::VhostSpec,
+) -> Result<AttachOutcome> {
+    let outcome = attach(config, spec).await?;
+
+    let source_path = config
+        .vhost_path_for(&spec.fqdn)
+        .strip_prefix(&config.tree.root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    crate::db::inventory::record_generated_vhost(pool, domain_id, &spec.runner_id, &source_path, &spec.server_names())
+        .await?;
+    crate::db::inventory::set_assignment(pool, domain_id, None, Some(Some(spec.runner_id.clone()))).await?;
+
+    Ok(outcome)
+}

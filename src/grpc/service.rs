@@ -47,6 +47,7 @@ use crate::db::dns_records as dns_records_db;
 use crate::db::domains as domains_db;
 use crate::db::inventory as inventory_db;
 use crate::db::orders as orders_db;
+use crate::db::reserved as reserved_db;
 use crate::db::releases as releases_db;
 use crate::inventory::scan;
 use crate::purchasing;
@@ -332,88 +333,46 @@ impl Domains {
         self.add_domain_response(fqdn, outcome, notes, outstanding, vhost).await
     }
 
-    /// Writes the DNS records into the zone we hold for `fqdn`, if we hold one.
-    ///
-    /// Returns the zone id and whether everything is now in place. Never
-    /// overwrites: see [`crate::intake::plan_dns`]. Every reason it did not
-    /// write is added to `notes`.
+    /// The free zone, or a precondition failure when the operator has not turned it on.
+    fn free_zone(&self) -> Result<String, Status> {
+        let zone = self.config.free_zone.zone.trim().to_ascii_lowercase();
+        if zone.is_empty() {
+            return Err(Status::failed_precondition("free addresses are not turned on"));
+        }
+        Ok(zone)
+    }
+
+    /// `(fqdn, why it cannot be claimed)` for a name a customer typed. Shape first, then the operator's
+    /// reservations, then whether somebody already holds it.
+    async fn free_name_problem(&self, zone: &str, name: &str) -> Result<(String, Option<String>), Status> {
+        let label = match crate::reserved::free_label(name) {
+            Ok(label) => label,
+            Err(why) => return Ok((format!("{}.{zone}", name.trim().to_ascii_lowercase()), Some(why))),
+        };
+        let fqdn = format!("{label}.{zone}");
+
+        let rules = reserved_db::rules(&self.pool).await.map_err(Status::from)?;
+        if crate::reserved::reserved_by(&rules, &label).is_some() {
+            return Ok((fqdn, Some("that name is reserved".to_owned())));
+        }
+        let taken = inventory_db::find_domain(&self.pool, &fqdn)
+            .await
+            .map_err(Status::from)?
+            .is_some_and(|row| row.status != "removed");
+        if taken {
+            return Ok((fqdn, Some("that name is already taken".to_owned())));
+        }
+        Ok((fqdn, None))
+    }
+
+    /// Writes the DNS records into the zone we hold for `fqdn`, if we hold one. See [`crate::dns::write`].
     async fn write_dns(
         &self,
         fqdn: &str,
         records: &[crate::intake::RecordSpec],
         notes: &mut Vec<String>,
     ) -> (Option<String>, bool) {
-        use crate::cloudflare::{CfSuite, dns, zones};
-
-        let cf = match CfSuite::new(&self.config, &self.secrets) {
-            Ok(cf) if cf.zones.has_token() => cf,
-            Ok(_) => {
-                notes.push("No Cloudflare zones token is configured, so DNS was not written.".to_owned());
-                return (None, false);
-            }
-            Err(err) => {
-                notes.push(format!("Cloudflare is unavailable ({err}), so DNS was not written."));
-                return (None, false);
-            }
-        };
-
-        let Some(apex) = crate::inventory::model::registrable_domain(fqdn) else {
-            return (None, false);
-        };
-        let zone = match zones::find(&cf.zones, &apex).await {
-            Ok(Some(zone)) => zone,
-            Ok(None) => {
-                notes.push(format!("We hold no Cloudflare zone for {apex}, so DNS was not written."));
-                return (None, false);
-            }
-            Err(err) => {
-                log!(LogLevel::Warn, "zone lookup for {apex} failed: {err}");
-                notes.push(format!("Looking up the Cloudflare zone for {apex} failed, so DNS was not written."));
-                return (None, false);
-            }
-        };
-
-        let mut existing = Vec::new();
-        let mut names: Vec<&str> = records.iter().map(|r| r.name.as_str()).collect();
-        names.sort_unstable();
-        names.dedup();
-        for name in names {
-            match dns::list(&cf.zones, &zone.id, None, Some(name)).await {
-                Ok(found) => existing.extend(found.into_iter().map(|r| crate::intake::ExistingRecord {
-                    record_type: r.record_type,
-                    name: r.name,
-                    content: r.content,
-                })),
-                Err(err) => {
-                    log!(LogLevel::Warn, "listing {name} in {apex} failed: {err}");
-                    notes.push(format!("Reading existing DNS for {name} failed, so nothing was written."));
-                    return (Some(zone.id), false);
-                }
-            }
-        }
-
-        let plan = crate::intake::plan_dns(records, &existing);
-        if !plan.conflicts.is_empty() {
-            notes.extend(plan.conflicts.iter().map(|c| format!("Not written: {c}.")));
-            return (Some(zone.id), false);
-        }
-
-        for record in &plan.create {
-            // DNS-only: the edge terminates TLS with our certificates, and a
-            // proxied record would put Cloudflare's certificate in front.
-            if let Err(err) = dns::create(&cf.zones, &zone.id, record.record_type, &record.name, &record.content, 1, Some(false)).await {
-                log!(LogLevel::Warn, "creating {} {} failed: {err}", record.record_type, record.name);
-                notes.push(format!("Creating {} {} failed ({err}); create the remaining records by hand.", record.record_type, record.name));
-                return (Some(zone.id), false);
-            }
-        }
-
-        notes.push(format!(
-            "DNS: created {} record(s), {} already correct, in the {apex} zone.",
-            plan.create.len(),
-            plan.present.len()
-        ));
-        (Some(zone.id), true)
+        crate::dns::write::write_records(&self.config, &self.secrets, fqdn, records, notes).await
     }
 
     async fn add_domain_response(
@@ -489,27 +448,7 @@ impl Domains {
         spec.cors = extras.cors;
         spec.extra_locations = extras.extra_locations;
 
-        let outcome = crate::vhost::attach(&self.config, &spec).await?;
-
-        let server_names = spec.server_names();
-        inventory_db::record_generated_vhost(
-            &self.pool,
-            existing.id,
-            runner_id,
-            &self
-                .config
-                .vhost_path_for(&existing.fqdn)
-                .strip_prefix(&self.config.tree.root)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            &server_names,
-        )
-        .await
-        .map_err(Status::from)?;
-
-        inventory_db::set_assignment(&self.pool, existing.id, None, Some(Some(runner_id.to_owned())))
-            .await
-            .map_err(Status::from)?;
+        let outcome = crate::vhost::attach_and_record(&self.config, &self.pool, existing.id, &spec).await?;
 
         log!(
             LogLevel::Info,
@@ -539,6 +478,51 @@ impl Domains {
 /// build if a marker goes missing. The notes are the RBAC Phase 6 mapping.
 fn pending(phase: &str, what: &str) -> Status {
     Status::unimplemented(format!("{what} lands in {phase}"))
+}
+
+fn require_super(role: Role, what: &str) -> Result<(), Status> {
+    if role != Role::Super {
+        return Err(Status::permission_denied(format!("{what} requires a super user")));
+    }
+    Ok(())
+}
+
+fn reserved_rule_from_request(req: &AddReservedNameRequest) -> Result<crate::reserved::Rule, Status> {
+    use crate::reserved::Rule;
+    let prefix = req.prefix.trim().to_owned();
+    let rule = match req.kind.as_str() {
+        "exact" => Rule::Exact(prefix),
+        "prefix" => Rule::Prefix(prefix),
+        "range" => Rule::Range {
+            prefix,
+            digits: u8::try_from(req.digits).map_err(|_| Status::invalid_argument("digits must be between 1 and 18"))?,
+            min: u64::try_from(req.min_value).map_err(|_| Status::invalid_argument("min_value must not be negative"))?,
+            max: u64::try_from(req.max_value).map_err(|_| Status::invalid_argument("max_value must not be negative"))?,
+        },
+        other => return Err(Status::invalid_argument(format!("kind must be exact, prefix or range, not {other:?}"))),
+    };
+    rule.validate().map_err(|e| Status::invalid_argument(e.to_string()))?;
+    Ok(rule)
+}
+
+fn reserved_response(row: reserved_db::ReservedRow) -> ReservedName {
+    use crate::reserved::Rule;
+    let (kind, prefix, digits, min, max) = match row.rule {
+        Rule::Exact(s) => ("exact", s, 0, 0, 0),
+        Rule::Prefix(s) => ("prefix", s, 0, 0, 0),
+        Rule::Range { prefix, digits, min, max } => ("range", prefix, i32::from(digits), min, max),
+    };
+    ReservedName {
+        id: row.id as i64,
+        kind: kind.to_owned(),
+        prefix,
+        digits,
+        min_value: min as i64,
+        max_value: max as i64,
+        note: row.note,
+        created_by: row.created_by.unwrap_or_default(),
+        created_at: row.created_at,
+    }
 }
 
 /// Database strings to proto enums. Anything unrecognised maps to
@@ -906,6 +890,25 @@ impl DomainService for Domains {
         let charge_org =
             if claims.role == Role::Super && !req.organization_id.is_empty() { req.organization_id } else { caller_org };
 
+        // AUTHZ: naming an app to attach the domain to is a write on that app, decided by `ais_auth` exactly
+        // as AttachDomain does. Without this an Admin could aim a domain they buy at someone else's runner,
+        // and the worker now attaches it for them when it finishes.
+        let backend = match req.backend.clone() {
+            Some(_) if req.runner_id.is_empty() => {
+                return Err(Status::invalid_argument("a backend needs the runner_id it belongs to"));
+            }
+            Some(backend) => match backend_from_proto(backend)? {
+                crate::vhost::render::Backend::Node { node_id, port } => Some((node_id, port)),
+                crate::vhost::render::Backend::Static { .. } => {
+                    return Err(Status::invalid_argument("an order's backend must be a node_id and port"));
+                }
+            },
+            None => None,
+        };
+        if !req.runner_id.is_empty() && self.may_write_runner(&claims, &req.runner_id).await? == Some(false) {
+            return Err(Status::permission_denied("not permitted to change that app"));
+        }
+
         // Fail closed: a purchase-shaped action refuses outright if Billing
         // can't even be asked whether this org is in good standing, rather
         // than assuming "fine" and letting a suspended (or unreachable-to-check)
@@ -929,13 +932,6 @@ impl DomainService for Domains {
             return Err(Status::permission_denied("this quote does not belong to this organization"));
         }
 
-        let within_caps = purchasing::under_caps(&self.pool, &charge_org, quote.price_cents, &self.config.purchasing)
-            .await
-            .map_err(Status::from)?;
-        if !within_caps {
-            return Err(Status::resource_exhausted("purchasing cap reached for this organization"));
-        }
-
         // One order per quote: a double submit (a double click, a retried
         // request) gets the order the first one made, not a second order and a
         // second charge.
@@ -949,8 +945,11 @@ impl DomainService for Domains {
             return Err(Status::already_exists(format!("{} is already registered here", quote.fqdn)));
         }
 
+        // The spending caps are checked inside this call, under a lock on the
+        // organization, so concurrent orders cannot each slip under a cap.
         let order_id = match orders_db::insert_order_with_job(
             &self.pool,
+            &self.config.purchasing,
             &quote.fqdn,
             &charge_org,
             &claims.sub,
@@ -963,7 +962,10 @@ impl DomainService for Domains {
         )
         .await
         {
-            Ok(id) => id,
+            Ok(orders_db::NewOrder::Created(id)) => id,
+            Ok(orders_db::NewOrder::CapReached) => {
+                return Err(Status::resource_exhausted("purchasing cap reached for this organization"));
+            }
             Err(err) if orders_db::is_duplicate(&err) => {
                 // Lost a race: either the same quote was submitted at the
                 // same instant, or another order is already buying this name.
@@ -982,6 +984,13 @@ impl DomainService for Domains {
             .await
             .map_err(Status::from)?
             .ok_or_else(|| Status::internal("order vanished mid-create"))?;
+
+        if let Some((node_id, port)) = backend {
+            // Only means "no auto-attach" if it fails, so it is logged rather than failing a paid-for order.
+            if let Err(err) = orders_db::set_backend(&self.pool, order_id, &node_id, port).await {
+                log!(LogLevel::Warn, "order {order_id}: could not record the backend: {err}");
+            }
+        }
 
         log!(LogLevel::Info, "{}: order {} created ({}c)", order.fqdn, order_id, order.price_cents);
 
@@ -2400,6 +2409,121 @@ impl DomainService for Domains {
         }))
     }
 
+    async fn list_reserved_names(
+        &self,
+        request: Request<ListReservedNamesRequest>,
+    ) -> Result<Response<ListReservedNamesResponse>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+        // Reservations are platform-wide policy about a zone the platform owns; no organization has a say.
+        require_super(claims.role, "reading reserved names")?;
+
+        let rows = reserved_db::list(&self.pool).await.map_err(Status::from)?;
+        Ok(Response::new(ListReservedNamesResponse {
+            rules: rows.into_iter().map(reserved_response).collect(),
+            free_zone: self.config.free_zone.zone.clone(),
+        }))
+    }
+
+    async fn add_reserved_name(
+        &self,
+        request: Request<AddReservedNameRequest>,
+    ) -> Result<Response<ReservedName>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+        // Reserving a name stops every customer from claiming it: an operator's call.
+        require_super(claims.role, "reserving a name")?;
+
+        let rule = reserved_rule_from_request(&req)?;
+        let id = reserved_db::add(&self.pool, &rule, &req.note, &claims.sub).await.map_err(Status::from)?;
+        let row = reserved_db::list(&self.pool)
+            .await
+            .map_err(Status::from)?
+            .into_iter()
+            .find(|r| r.id == id)
+            .ok_or_else(|| Status::internal("reservation vanished after it was stored"))?;
+        Ok(Response::new(reserved_response(row)))
+    }
+
+    async fn remove_reserved_name(
+        &self,
+        request: Request<RemoveReservedNameRequest>,
+    ) -> Result<Response<RemoveReservedNameResponse>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+        // Lifting a reservation lets customers claim the names it covered: an operator's call.
+        require_super(claims.role, "lifting a reservation")?;
+
+        let id = u64::try_from(req.id).map_err(|_| Status::invalid_argument("id must be positive"))?;
+        let removed = reserved_db::remove(&self.pool, id).await.map_err(Status::from)?;
+        if !removed {
+            return Err(Status::not_found("no such reservation"));
+        }
+        Ok(Response::new(RemoveReservedNameResponse { removed }))
+    }
+
+    async fn check_free_name(
+        &self,
+        request: Request<CheckFreeNameRequest>,
+    ) -> Result<Response<CheckFreeNameResponse>, Status> {
+        let req = request.into_inner();
+        // AUTHZ: any signed-in caller may ask; it reveals only whether a name is free, which a claim
+        // would reveal anyway.
+        self.caller(&req.access_token).await?;
+
+        let zone = self.free_zone()?;
+        let (fqdn, problem) = self.free_name_problem(&zone, &req.name).await?;
+        Ok(Response::new(CheckFreeNameResponse {
+            available: problem.is_none(),
+            fqdn,
+            reason: problem.unwrap_or_default(),
+            free_zone: zone,
+        }))
+    }
+
+    async fn claim_free_address(
+        &self,
+        request: Request<ClaimFreeAddressRequest>,
+    ) -> Result<Response<AddDomainResponse>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+
+        // AUTHZ: the same bar as adding a domain (an org Admin, or Super), plus `ais_auth`'s decision on the
+        // runner the name is for. The owner is the caller's own organization, never taken from the request.
+        authz::may_add_domain(claims.role, &claims.organization_id).map_err(|d| d.into_status(&req.name))?;
+        if req.runner_id.is_empty() {
+            return Err(Status::invalid_argument("a free address belongs to an app: runner_id is required"));
+        }
+        let runner = self.may_write_runner(&claims, &req.runner_id).await?;
+        if runner == Some(false) {
+            return Err(Status::permission_denied("not permitted to change that app"));
+        }
+        let org = authz::real_org(&claims.organization_id)
+            .map(str::to_owned)
+            .ok_or_else(|| Status::permission_denied(authz::Denial::NoOrg.message("")))?;
+
+        let zone = self.free_zone()?;
+        let (fqdn, problem) = self.free_name_problem(&zone, &req.name).await?;
+        if let Some(reason) = problem {
+            return Err(Status::failed_precondition(reason));
+        }
+
+        // The zone is recorded (and holds the wildcard certificate) by an operator; without that row there
+        // is nothing for a free name to ride on.
+        let parent = inventory_db::find_domain(&self.pool, &zone)
+            .await
+            .map_err(Status::from)?
+            .filter(|row| row.status != "removed")
+            .ok_or_else(|| Status::failed_precondition(format!("{zone} is not set up as a managed domain yet")))?;
+
+        let add = AddDomainRequest {
+            runner_id: req.runner_id,
+            backends: req.backends,
+            ..Default::default()
+        };
+        self.add_subdomain(&claims, &add, &fqdn, &parent, Some(org)).await
+    }
+
     async fn list_adopted_vhosts(
         &self,
         request: Request<ListAdoptedVhostsRequest>,
@@ -2710,6 +2834,38 @@ mod authorization_contracts {
         );
     }
 
+    fn add_req(kind: &str, prefix: &str, digits: i32, min: i64, max: i64) -> AddReservedNameRequest {
+        AddReservedNameRequest { kind: kind.into(), prefix: prefix.into(), digits, min_value: min, max_value: max, ..Default::default() }
+    }
+
+    #[test]
+    fn a_reserved_name_request_maps_to_a_rule_and_bad_ones_are_invalid_argument() {
+        use crate::reserved::Rule;
+        assert_eq!(
+            reserved_rule_from_request(&add_req("range", "c", 8, 0, 99_999_999)).unwrap(),
+            Rule::Range { prefix: "c".into(), digits: 8, min: 0, max: 99_999_999 }
+        );
+        assert_eq!(reserved_rule_from_request(&add_req("exact", " www ", 0, 0, 0)).unwrap(), Rule::Exact("www".into()));
+        for bad in [
+            add_req("regex", "c.*", 0, 0, 0),
+            add_req("range", "c", 300, 0, 1),
+            add_req("range", "c", 8, -1, 5),
+            add_req("range", "c", 3, 0, 1000),
+            add_req("exact", "Has Space", 0, 0, 0),
+        ] {
+            let status = reserved_rule_from_request(&bad).unwrap_err();
+            assert_eq!(status.code(), Code::InvalidArgument, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_super_may_change_reservations() {
+        for role in [Role::Admin, Role::Controller, Role::Viewer, Role::Audit, Role::None] {
+            assert_eq!(require_super(role, "x").unwrap_err().code(), Code::PermissionDenied);
+        }
+        assert!(require_super(Role::Super, "x").is_ok());
+    }
+
     fn service() -> Domains {
         // Nothing here touches the database or ais_auth: every RPC below
         // rejects an empty token before reading anything else. A lazy pool
@@ -2814,6 +2970,23 @@ mod authorization_contracts {
             ("force_renew", service.force_renew(Request::new(ForceRenewRequest::default())).await.err()),
             ("publish_now", service.publish_now(Request::new(PublishNowRequest::default())).await.err()),
             ("list_releases", service.list_releases(Request::new(ListReleasesRequest::default())).await.err()),
+            (
+                "list_reserved_names",
+                service.list_reserved_names(Request::new(ListReservedNamesRequest::default())).await.err(),
+            ),
+            (
+                "add_reserved_name",
+                service.add_reserved_name(Request::new(AddReservedNameRequest::default())).await.err(),
+            ),
+            ("check_free_name", service.check_free_name(Request::new(CheckFreeNameRequest::default())).await.err()),
+            (
+                "claim_free_address",
+                service.claim_free_address(Request::new(ClaimFreeAddressRequest::default())).await.err(),
+            ),
+            (
+                "remove_reserved_name",
+                service.remove_reserved_name(Request::new(RemoveReservedNameRequest::default())).await.err(),
+            ),
         ] {
             let status = status.unwrap_or_else(|| panic!("{name}: no token is not a valid request"));
             assert_eq!(status.code(), Code::Unauthenticated, "{name}: {}", status.message());

@@ -35,6 +35,13 @@
     "propagation_timeout_secs": 300
   },
 
+  "free_zone": {
+    // The zone free `<name>.<zone>` addresses are handed out of. Empty turns them off. The zone must also be
+    // recorded as a managed domain (with a wildcard certificate) and its Cloudflare zone must be ours.
+    // What may not be claimed is not here: it lives in the `reserved_names` table (Super-only screen).
+    "zone": ""
+  },
+
   "cloudflare": {
     "api_base": "https://api.cloudflare.com/client/v4",
     // Narrowest domain-scoped role that still lets a customer manage their DNS.

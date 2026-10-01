@@ -233,6 +233,16 @@ impl Worker {
         JobOutcome::Done
     }
 
+    /// The registration is known not to have happened: write that down first,
+    /// then refund. If the refund fails and the job retries, the order is
+    /// already marked `failed` and the retry only repeats the refund.
+    async fn fail_registration_and_refund(&self, order: &OrderRow, reason: &str) -> JobOutcome {
+        if let Err(err) = orders_db::record_registration_failure(&self.pool, order.id, reason).await {
+            return JobOutcome::Failed(format!("order {}: could not record the failed registration: {err}", order.id));
+        }
+        self.refund_and_close(order, reason).await
+    }
+
     /// Re-checks the registry's real-time price right before buying.
     async fn recheck_cost(&self, order: &OrderRow, cf: &CfSuite) -> Result<(), Recheck> {
         let answers = registrar::check(&cf.registrar, &cf.account_id, &[order.fqdn.clone()])
@@ -280,13 +290,23 @@ impl Worker {
             match registrar::register(&cf.registrar, &cf.account_id, &request, true).await {
                 Ok(result) => result,
                 Err(err) if definitely_not_registered(&err) => {
-                    return self.refund_and_close(order, &format!("the registrar refused the registration: {err}")).await;
+                    return self
+                        .fail_registration_and_refund(order, &format!("the registrar refused the registration: {err}"))
+                        .await;
                 }
                 // Timeout, 5xx, undecodable: the purchase may or may not have
                 // happened. It is recorded as requested, so the next run
                 // *polls* for it and never buys again.
                 Err(err) => return JobOutcome::Failed(format!("order {}: registrar purchase: {err}", order.id)),
             }
+        } else if order.cf_workflow_state.as_deref() == Some("failed") {
+            // An earlier run established the registration failed and was
+            // refunding when it stopped (the refund itself failed). Go straight
+            // back to the refund: polling the registrar again would find no
+            // registration, fail the same way, and end up needing an admin
+            // for an order that only needs its refund retried.
+            let reason = order.last_error.clone().unwrap_or_else(|| "the registration failed".to_owned());
+            return self.refund_and_close(order, &reason).await;
         } else {
             match registrar::registration_status(&cf.registrar, &cf.account_id, &order.fqdn).await {
                 Ok(result) => result,
@@ -294,8 +314,13 @@ impl Worker {
             }
         };
 
-        if let Err(err) = orders_db::set_cf_workflow_state(&self.pool, order.id, registration.state.as_str()).await {
-            log!(LogLevel::Warn, "order {}: could not record workflow state: {}", order.id, err);
+        // `failed` is recorded together with its reason in the failure branch
+        // below, which must succeed before the refund; every other state is
+        // only a progress note.
+        if registration.state != RegistrationState::Failed {
+            if let Err(err) = orders_db::set_cf_workflow_state(&self.pool, order.id, registration.state.as_str()).await {
+                log!(LogLevel::Warn, "order {}: could not record workflow state: {}", order.id, err);
+            }
         }
 
         match registration.state {
@@ -305,7 +330,7 @@ impl Worker {
                     .error
                     .map(|e| e.message)
                     .unwrap_or_else(|| "the registry declined this registration".to_owned());
-                self.refund_and_close(order, &message).await
+                self.fail_registration_and_refund(order, &message).await
             }
             // The registry wants something a person has to do (contact
             // verification, a block). The customer's money stays put until
@@ -370,24 +395,83 @@ impl Worker {
             log!(LogLevel::Warn, "order {}: could not mark the domain active: {}", order.id, err);
         }
 
-        // Per the resolved design: purchase only ever records the org/runner
-        // assignment. Standing up a vhost is a separate, explicit
-        // AttachDomain call once the caller has real backend info.
-        if let Some(runner_id) = order.runner_id.as_deref().filter(|id| !id.is_empty()) {
-            if let Err(err) =
-                crate::db::inventory::set_assignment(&self.pool, domain_id, None, Some(Some(runner_id.to_owned())))
-                    .await
-            {
-                log!(LogLevel::Warn, "order {}: could not record the runner assignment: {}", order.id, err);
-            }
-        }
-
         if let Err(err) = orders_db::finish_order(&self.pool, order.id, domain_id).await {
             return JobOutcome::Failed(format!("order {}: marking the order complete: {err}", order.id));
         }
 
+        // The order is closed first because closing clears `last_error`, and go_live may need to leave a note
+        // there. Neither step can undo the purchase, so a failure is recorded on the order for a person (or the
+        // dashboard's retry) and never becomes a refund.
+        self.go_live(order, domain_id).await;
+
         log!(LogLevel::Info, "order {}: {} registered and issued", order.id, order.fqdn);
         JobOutcome::Done
+    }
+}
+
+impl Worker {
+    /// Points a freshly registered domain at the edge and, when the order named an app, attaches it.
+    ///
+    /// Best effort by design: the customer has paid and the domain exists, so nothing here may fail the
+    /// order. What could not be done is recorded in the log and in `last_error` for the operator.
+    async fn go_live(&self, order: &OrderRow, domain_id: u64) {
+        // 1. Edge A/AAAA. The challenge CNAME was already written; without these the name resolves to nothing.
+        match crate::intake::required_records(&self.config, &order.fqdn, false) {
+            Ok(records) => {
+                let mut notes = Vec::new();
+                let (_, written) =
+                    crate::dns::write::write_records(&self.config, &self.secrets, &order.fqdn, &records, &mut notes).await;
+                for note in &notes {
+                    log!(LogLevel::Info, "order {}: {note}", order.id);
+                }
+                if !written {
+                    self.note_trouble(order, "the edge A/AAAA records were not all written; add them by hand").await;
+                }
+            }
+            Err(err) => {
+                self.note_trouble(order, &format!("no edge records to write: {err}")).await;
+            }
+        }
+
+        // 2. Attach, only when the order says where the app is. The runner was authorized when the order was
+        //    created; nothing here widens that.
+        let (Some(runner_id), Some(node_id), Some(port)) = (
+            order.runner_id.as_deref().filter(|id| !id.is_empty()),
+            order.backend_node_id.as_deref().filter(|id| !id.is_empty()),
+            order.backend_port,
+        ) else {
+            if let Some(runner_id) = order.runner_id.as_deref().filter(|id| !id.is_empty()) {
+                // No backend recorded: keep the old behaviour of recording the assignment and stopping.
+                if let Err(err) =
+                    crate::db::inventory::set_assignment(&self.pool, domain_id, None, Some(Some(runner_id.to_owned())))
+                        .await
+                {
+                    log!(LogLevel::Warn, "order {}: could not record the runner assignment: {}", order.id, err);
+                }
+            }
+            return;
+        };
+
+        let mut spec = crate::vhost::render::VhostSpec::new(
+            &order.fqdn,
+            runner_id,
+            vec![crate::vhost::render::Backend::Node { node_id: node_id.to_owned(), port }],
+        );
+        spec.http_redirect = true;
+        match crate::vhost::attach_and_record(&self.config, &self.pool, domain_id, &spec).await {
+            Ok(_) => log!(LogLevel::Info, "order {}: {} attached to {runner_id}", order.id, order.fqdn),
+            Err(err) => {
+                log!(LogLevel::Warn, "order {}: attaching {} failed: {err}", order.id, order.fqdn);
+                self.note_trouble(order, &format!("the domain was bought but attaching it failed ({err}); attach it from the app page")).await;
+            }
+        }
+    }
+
+    async fn note_trouble(&self, order: &OrderRow, message: &str) {
+        log!(LogLevel::Warn, "order {}: {message}", order.id);
+        if let Err(err) = orders_db::set_last_error(&self.pool, order.id, message).await {
+            log!(LogLevel::Warn, "order {}: could not record that: {err}", order.id);
+        }
     }
 }
 

@@ -66,6 +66,7 @@ pub mod inventory;
 pub mod mtls_client;
 pub mod proto;
 pub mod publish;
+pub mod reserved;
 pub mod purchasing;
 pub mod vhost;
 pub mod worker;

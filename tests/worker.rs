@@ -649,6 +649,17 @@ mod purchase {
             (row.get("state"), row.get("cf_workflow_state"), row.get("stripe_refund_id"), row.get("last_error"))
         }
 
+        async fn order_extended(&self, id: u64) -> (String, Option<String>, Option<String>, Option<String>, Option<String>) {
+            let row = sqlx::query(
+                "SELECT state, cf_workflow_state, stripe_refund_id, last_error, live_fqdn FROM domain_orders WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap();
+            (row.get("state"), row.get("cf_workflow_state"), row.get("stripe_refund_id"), row.get("last_error"), row.get("live_fqdn"))
+        }
+
         async fn make_job_due(&self, job: u64) {
             sqlx::query("UPDATE jobs SET next_run_at = NOW() - INTERVAL 1 SECOND WHERE id = ?")
                 .bind(job)
@@ -757,6 +768,39 @@ mod purchase {
         assert_eq!(refund_id.as_deref(), Some("re_test"));
         assert!(why.unwrap().contains("registrar refused"));
         assert_eq!(billing.0.lock().unwrap().refunded.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_refund_after_a_rejection_is_retried_without_asking_the_registrar_again() {
+        need_mariadb!();
+        let db = TestDb::start("refund-retry-no-poll").await;
+        let (order, job) = db.paid_order().await;
+        let (billing_addr, billing) = serve_billing(PaymentIntentStatus::Succeeded).await;
+        billing.0.lock().unwrap().fail_refunds = true;
+        // No route for the registration-status poll: asking would be a 404 and
+        // would send the order to an admin.
+        let (cf, hits) = serve_cloudflare(vec![
+            (CHECK, check_answer(true, "5.00")),
+            (REGISTRATIONS, rejected(400, "domain unavailable")),
+        ])
+        .await;
+        let worker = worker_for(&db, &billing_addr, &cf);
+
+        assert!(worker.run_once().await.unwrap());
+        let (state, cf_state, refund_id, why) = db.order(order).await;
+        assert_eq!((state.as_str(), cf_state.as_deref(), refund_id), ("registering", Some("failed"), None));
+        assert!(why.unwrap().contains("registrar refused"), "the reason survives for the retry");
+
+        billing.0.lock().unwrap().fail_refunds = false;
+        db.make_job_due(job).await;
+        assert!(worker.run_once().await.unwrap());
+
+        let (state, _, refund_id, why) = db.order(order).await;
+        assert_eq!((state.as_str(), refund_id.as_deref()), ("refunded", Some("re_test")));
+        assert!(why.unwrap().contains("registrar refused"));
+        assert_eq!(hits.count(REGISTRATIONS), 1, "never a second purchase");
+        assert_eq!(hits.count(STATUS), 0, "the retry only refunds");
+        assert_eq!(db.job_row(job).await.state, "done");
     }
 
     #[tokio::test]
@@ -900,6 +944,165 @@ mod purchase {
     }
 
     #[tokio::test]
+    async fn a_completed_order_keeps_holding_its_name() {
+        need_mariadb!();
+        let db = TestDb::start("completed-holds").await;
+        let order = db.insert_order("completed").await;
+
+        // A completed order keeps live_fqdn set, so an already-bought name
+        // cannot be bought a second time.
+        let live_fqdn: Option<String> = sqlx::query_scalar("SELECT live_fqdn FROM domain_orders WHERE id = ?")
+            .bind(order)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(live_fqdn.as_deref(), Some("example.test"), "completed orders keep holding their name");
+    }
+
+    #[tokio::test]
+    async fn a_failed_order_releases_its_name_for_reuse() {
+        need_mariadb!();
+        let db = TestDb::start("failed-releases").await;
+        let order = db.insert_order("failed").await;
+
+        let live_fqdn: Option<String> = sqlx::query_scalar("SELECT live_fqdn FROM domain_orders WHERE id = ?")
+            .bind(order)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(live_fqdn, None, "failed orders release their live_fqdn");
+    }
+
+    #[tokio::test]
+    async fn a_refunded_order_releases_its_name_for_reuse() {
+        need_mariadb!();
+        let db = TestDb::start("refunded-releases").await;
+        let order = db.insert_order("refunded").await;
+
+        let live_fqdn: Option<String> = sqlx::query_scalar("SELECT live_fqdn FROM domain_orders WHERE id = ?")
+            .bind(order)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(live_fqdn, None, "refunded orders release their live_fqdn");
+    }
+
+    #[tokio::test]
+    async fn the_register_job_records_stripe_refund_id_on_failure() {
+        need_mariadb!();
+        let db = TestDb::start("refund-id-recorded").await;
+        let (order, job) = db.paid_order().await;
+        let (billing_addr, billing) = serve_billing(PaymentIntentStatus::Succeeded).await;
+        let (cf, _hits) = serve_cloudflare(vec![(CHECK, check_answer(false, ""))]).await;
+
+        assert!(worker_for(&db, &billing_addr, &cf).run_once().await.unwrap());
+
+        let (state, _, refund_id, _) = db.order(order).await;
+        assert_eq!(state, "refunded");
+        assert_eq!(refund_id.as_deref(), Some("re_test"), "stripe_refund_id must be set on refund");
+        assert_eq!(billing.0.lock().unwrap().refunded.len(), 1);
+        assert_eq!(db.job_row(job).await.state, "done");
+    }
+
+    #[tokio::test]
+    async fn a_refund_failure_keeps_the_order_in_flight_for_admin_review() {
+        need_mariadb!();
+        let db = TestDb::start("refund-fails-inflight").await;
+        let (order, job) = db.paid_order().await;
+        let (billing_addr, billing) = serve_billing(PaymentIntentStatus::Succeeded).await;
+        billing.0.lock().unwrap().fail_refunds = true;
+        let (cf, _hits) = serve_cloudflare(vec![(CHECK, check_answer(false, ""))]).await;
+        // Already on its last attempt.
+        sqlx::query("UPDATE jobs SET attempts = 4 WHERE id = ?").bind(job).execute(&db.pool).await.unwrap();
+
+        assert!(worker_for(&db, &billing_addr, &cf).run_once().await.unwrap());
+
+        let (state, _, refund_id, last_error, _) = db.order_extended(order).await;
+        assert_eq!(state, "needs_admin");
+        assert_eq!(refund_id, None, "no refund id because the refund never succeeded");
+        assert!(last_error.unwrap().contains("gave up after 5 attempts"));
+        assert_eq!(db.job_row(job).await.state, "failed");
+    }
+
+    #[tokio::test]
+    async fn double_submit_of_same_quote_returns_existing_order_not_new_one() {
+        need_mariadb!();
+        let db = TestDb::start("double-submit").await;
+        let quote_id = "test-quote-123";
+
+        // First submit
+        let order1 = sqlx::query(
+            "INSERT INTO domain_orders \
+             (fqdn, organization_id, user_id, quote_id, cost_cents, price_cents, currency, state, runner_id, invite_email) \
+             VALUES ('example1.test', 'org-1', 'user-1', ?, 500, 600, 'usd', 'awaiting_payment', '', '')",
+        )
+        .bind(quote_id)
+        .execute(&db.pool)
+        .await
+        .unwrap()
+        .last_insert_id();
+
+        sqlx::query("INSERT INTO jobs (kind, order_id) VALUES ('register', ?)").bind(order1).execute(&db.pool).await.unwrap();
+
+        // Second submit with same quote_id (simulates double-click or retry)
+        let order2 = sqlx::query(
+            "INSERT INTO domain_orders \
+             (fqdn, organization_id, user_id, quote_id, cost_cents, price_cents, currency, state, runner_id, invite_email) \
+             VALUES ('example1.test', 'org-1', 'user-1', ?, 500, 600, 'usd', 'awaiting_payment', '', '')",
+        )
+        .bind(quote_id)
+        .execute(&db.pool)
+        .await;
+
+        // Should fail with duplicate key error
+        assert!(order2.is_err(), "second order with same quote_id should fail");
+        let err = order2.unwrap_err();
+        assert!(err.to_string().contains("Duplicate entry"), "should be a duplicate key error");
+
+        // Only one order should exist
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM domain_orders WHERE quote_id = ?")
+            .bind(quote_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "only one order should exist");
+    }
+
+    #[tokio::test]
+    async fn a_paid_order_keeps_its_name_until_refund_or_failure() {
+        need_mariadb!();
+        let db = TestDb::start("paid-holds-name").await;
+        let order = db.insert_order("paid").await;
+
+        let live_fqdn: Option<String> = sqlx::query_scalar("SELECT live_fqdn FROM domain_orders WHERE id = ?")
+            .bind(order)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(live_fqdn.as_deref(), Some("example.test"), "paid orders hold their name");
+    }
+
+    #[tokio::test]
+    async fn the_register_job_checks_price_before_buying() {
+        need_mariadb!();
+        let db = TestDb::start("price-check-before-buy").await;
+        let (order, job) = db.paid_order().await;
+        let (billing_addr, billing) = serve_billing(PaymentIntentStatus::Succeeded).await;
+        // Quoted at 600c, default drift 100c: 7.00 = 700c is past the 700c threshold
+        let (cf, hits) = serve_cloudflare(vec![(CHECK, check_answer(true, "7.00"))]).await;
+
+        assert!(worker_for(&db, &billing_addr, &cf).run_once().await.unwrap());
+
+        let (state, _, refund_id, why) = db.order(order).await;
+        assert_eq!(state, "refunded");
+        assert_eq!(refund_id.as_deref(), Some("re_test"));
+        assert!(why.unwrap().contains("700c"), "error message should mention the new price");
+        assert_eq!(hits.count(REGISTRATIONS), 0, "registration not attempted when price exceeds threshold");
+        assert_eq!(billing.0.lock().unwrap().refunded, vec![format!("domain_management:{order}")]);
+        assert_eq!(db.job_row(job).await.state, "done");
+    }
+
+    #[tokio::test]
     async fn a_needs_admin_order_with_no_registration_started_is_payment_checked_not_bought() {
         need_mariadb!();
         let db = TestDb::start("requeued").await;
@@ -919,7 +1122,120 @@ mod purchase {
     // ----- the order tables -----
 
     async fn insert(db: &TestDb, fqdn: &str, quote: &str) -> Result<u64, ais_domains::error::Error> {
-        ais_domains::db::orders::insert_order_with_job(&db.pool, fqdn, "org-1", "user-1", quote, 500, 600, "USD", "", "").await
+        match insert_under(db, &ais_domains::config::Purchasing::default(), fqdn, quote).await? {
+            ais_domains::db::orders::NewOrder::Created(id) => Ok(id),
+            ais_domains::db::orders::NewOrder::CapReached => panic!("default caps should not be reached"),
+        }
+    }
+
+    async fn insert_under(
+        db: &TestDb,
+        purchasing: &ais_domains::config::Purchasing,
+        fqdn: &str,
+        quote: &str,
+    ) -> Result<ais_domains::db::orders::NewOrder, ais_domains::error::Error> {
+        ais_domains::db::orders::insert_order_with_job(
+            &db.pool, purchasing, fqdn, "org-1", "user-1", quote, 500, 600, "USD", "", "",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn an_order_remembers_where_its_app_answers() {
+        need_mariadb!();
+        let db = TestDb::start("order-backend").await;
+        let purchasing = ais_domains::config::Purchasing::default();
+
+        let id = match insert_under(&db, &purchasing, "shop.example", "q-backend").await.unwrap() {
+            ais_domains::db::orders::NewOrder::Created(id) => id,
+            other => panic!("expected an order, got {other:?}"),
+        };
+        let fresh = ais_domains::db::orders::find_order(&db.pool, id).await.unwrap().unwrap();
+        assert_eq!((fresh.backend_node_id, fresh.backend_port), (None, None), "no backend until one is recorded");
+
+        ais_domains::db::orders::set_backend(&db.pool, id, "node-7", 20_345).await.unwrap();
+        let after = ais_domains::db::orders::find_order(&db.pool, id).await.unwrap().unwrap();
+        assert_eq!(after.backend_node_id.as_deref(), Some("node-7"));
+        assert_eq!(after.backend_port, Some(20_345));
+    }
+
+    #[tokio::test]
+    async fn concurrent_orders_cannot_exceed_the_daily_cap_together() {
+        need_mariadb!();
+        let db = TestDb::start("cap-daily-race").await;
+        let mut purchasing = ais_domains::config::Purchasing::default();
+        purchasing.orders_per_org_per_day = 2;
+
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let pool = db.pool.clone();
+            let purchasing = purchasing.clone();
+            tasks.push(tokio::spawn(async move {
+                ais_domains::db::orders::insert_order_with_job(
+                    &pool, &purchasing, &format!("n{i}.example"), "org-1", "user-1", &format!("q-{i}"), 500, 600, "USD", "", "",
+                )
+                .await
+                .unwrap()
+            }));
+        }
+        let mut created = 0;
+        for task in tasks {
+            if matches!(task.await.unwrap(), ais_domains::db::orders::NewOrder::Created(_)) {
+                created += 1;
+            }
+        }
+        assert_eq!(created, 2, "exactly the cap, however the orders interleave");
+        let orders: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM domain_orders").fetch_one(&db.pool).await.unwrap();
+        let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs").fetch_one(&db.pool).await.unwrap();
+        assert_eq!((orders, jobs), (2, 2), "a refused order leaves nothing behind");
+    }
+
+    #[tokio::test]
+    async fn concurrent_orders_cannot_exceed_the_monthly_spend_cap_together() {
+        need_mariadb!();
+        let db = TestDb::start("cap-monthly-race").await;
+        let mut purchasing = ais_domains::config::Purchasing::default();
+        purchasing.monthly_cap_cents = 1_300; // two 600c orders fit, a third does not
+
+        let mut tasks = Vec::new();
+        for i in 0..6 {
+            let pool = db.pool.clone();
+            let purchasing = purchasing.clone();
+            tasks.push(tokio::spawn(async move {
+                ais_domains::db::orders::insert_order_with_job(
+                    &pool, &purchasing, &format!("m{i}.example"), "org-1", "user-1", &format!("mq-{i}"), 500, 600, "USD", "", "",
+                )
+                .await
+                .unwrap()
+            }));
+        }
+        let mut created = 0;
+        for task in tasks {
+            if matches!(task.await.unwrap(), ais_domains::db::orders::NewOrder::Created(_)) {
+                created += 1;
+            }
+        }
+        assert_eq!(created, 2);
+    }
+
+    #[tokio::test]
+    async fn another_organizations_orders_do_not_count_against_a_cap() {
+        need_mariadb!();
+        let db = TestDb::start("cap-per-org").await;
+        let mut purchasing = ais_domains::config::Purchasing::default();
+        purchasing.orders_per_org_per_day = 1;
+
+        let first = insert_under(&db, &purchasing, "one.example", "o-1").await.unwrap();
+        assert!(matches!(first, ais_domains::db::orders::NewOrder::Created(_)));
+        let second = insert_under(&db, &purchasing, "two.example", "o-2").await.unwrap();
+        assert_eq!(second, ais_domains::db::orders::NewOrder::CapReached);
+
+        let other = ais_domains::db::orders::insert_order_with_job(
+            &db.pool, &purchasing, "three.example", "org-2", "user-9", "o-3", 500, 600, "USD", "", "",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(other, ais_domains::db::orders::NewOrder::Created(_)));
     }
 
     #[tokio::test]

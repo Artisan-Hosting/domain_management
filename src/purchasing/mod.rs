@@ -7,7 +7,7 @@
 //! touches the database, since a spending cap is inherently a question
 //! about this organization's history.
 
-use sqlx::MySqlPool;
+use sqlx::MySqlConnection;
 
 use crate::config::{Pricing, Purchasing};
 use crate::error::Result;
@@ -43,11 +43,14 @@ pub fn tld_allowed(fqdn: &str, pricing: &Pricing) -> bool {
 
 /// Whether a new order of `new_order_price_cents` would keep `organization_id`
 /// under both its daily order-count cap and its monthly spend cap. Checked
-/// together, not as two separate calls, so a caller can't observe one
-/// passing and the other failing as two different round trips racing
-/// against a concurrent order.
+/// together, not as two separate calls.
+///
+/// This only *reads*: two concurrent orders can both pass it. The caller must
+/// hold the organization's order lock (`orders::lock_org_orders`) from this
+/// check through the insert it guards, which is what
+/// `orders::insert_order_with_job` does.
 pub async fn under_caps(
-    pool: &MySqlPool,
+    conn: &mut MySqlConnection,
     organization_id: &str,
     new_order_price_cents: i64,
     purchasing: &Purchasing,
@@ -56,7 +59,7 @@ pub async fn under_caps(
         "SELECT COUNT(*) FROM domain_orders WHERE organization_id = ? AND created_at >= CURDATE()",
     )
     .bind(organization_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     if today_count >= purchasing.orders_per_org_per_day {
         return Ok(false);
@@ -65,12 +68,12 @@ pub async fn under_caps(
     // Refunded/failed orders never completed a real charge, so they don't
     // count against the monthly cap.
     let month_spent: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(price_cents), 0) FROM domain_orders \
+        "SELECT CAST(COALESCE(SUM(price_cents), 0) AS SIGNED) FROM domain_orders \
          WHERE organization_id = ? AND state NOT IN ('refunded', 'failed') \
          AND created_at >= DATE_FORMAT(NOW(), '%Y-%m-01')",
     )
     .bind(organization_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     if month_spent.saturating_add(new_order_price_cents) > purchasing.monthly_cap_cents {
         return Ok(false);
