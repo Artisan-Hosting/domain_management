@@ -396,8 +396,10 @@ pub async fn list_findings(
     open_only: bool,
     limit: i64,
 ) -> Result<Vec<FindingRow>> {
+    // The CAST matters: COALESCE over JSON_UNQUOTE can come back typed LONGBLOB,
+    // which sqlx will not decode into a String (it panicked in row.get).
     let mut builder = QueryBuilder::new(
-        "SELECT code, severity, subject, COALESCE(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.message')), '') AS message, \
+        "SELECT code, severity, subject, CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.message')), '') AS CHAR) AS message, \
          UNIX_TIMESTAMP(first_seen) AS first_seen, UNIX_TIMESTAMP(last_seen) AS last_seen, \
          UNIX_TIMESTAMP(resolved_at) AS resolved_at \
          FROM inventory_findings WHERE 1 = 1",
