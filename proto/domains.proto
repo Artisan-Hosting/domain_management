@@ -823,6 +823,8 @@ message CheckFreeNameResponse {
   string fqdn = 2;
   // Why not, in words a customer can act on. Empty when available.
   string reason = 3;
+  // The zone free names live under, so a screen can show `<name>.<free_zone>` before anything is typed.
+  string free_zone = 4;
 }
 
 message ClaimFreeAddressRequest {

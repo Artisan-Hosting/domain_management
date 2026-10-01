@@ -2477,6 +2477,7 @@ impl DomainService for Domains {
             available: problem.is_none(),
             fqdn,
             reason: problem.unwrap_or_default(),
+            free_zone: zone,
         }))
     }
 
