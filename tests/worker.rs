@@ -1141,6 +1141,25 @@ mod purchase {
     }
 
     #[tokio::test]
+    async fn an_order_remembers_where_its_app_answers() {
+        need_mariadb!();
+        let db = TestDb::start("order-backend").await;
+        let purchasing = ais_domains::config::Purchasing::default();
+
+        let id = match insert_under(&db, &purchasing, "shop.example", "q-backend").await.unwrap() {
+            ais_domains::db::orders::NewOrder::Created(id) => id,
+            other => panic!("expected an order, got {other:?}"),
+        };
+        let fresh = ais_domains::db::orders::find_order(&db.pool, id).await.unwrap().unwrap();
+        assert_eq!((fresh.backend_node_id, fresh.backend_port), (None, None), "no backend until one is recorded");
+
+        ais_domains::db::orders::set_backend(&db.pool, id, "node-7", 20_345).await.unwrap();
+        let after = ais_domains::db::orders::find_order(&db.pool, id).await.unwrap().unwrap();
+        assert_eq!(after.backend_node_id.as_deref(), Some("node-7"));
+        assert_eq!(after.backend_port, Some(20_345));
+    }
+
+    #[tokio::test]
     async fn concurrent_orders_cannot_exceed_the_daily_cap_together() {
         need_mariadb!();
         let db = TestDb::start("cap-daily-race").await;

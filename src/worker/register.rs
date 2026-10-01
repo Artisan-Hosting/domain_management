@@ -395,24 +395,83 @@ impl Worker {
             log!(LogLevel::Warn, "order {}: could not mark the domain active: {}", order.id, err);
         }
 
-        // Per the resolved design: purchase only ever records the org/runner
-        // assignment. Standing up a vhost is a separate, explicit
-        // AttachDomain call once the caller has real backend info.
-        if let Some(runner_id) = order.runner_id.as_deref().filter(|id| !id.is_empty()) {
-            if let Err(err) =
-                crate::db::inventory::set_assignment(&self.pool, domain_id, None, Some(Some(runner_id.to_owned())))
-                    .await
-            {
-                log!(LogLevel::Warn, "order {}: could not record the runner assignment: {}", order.id, err);
-            }
-        }
-
         if let Err(err) = orders_db::finish_order(&self.pool, order.id, domain_id).await {
             return JobOutcome::Failed(format!("order {}: marking the order complete: {err}", order.id));
         }
 
+        // The order is closed first because closing clears `last_error`, and go_live may need to leave a note
+        // there. Neither step can undo the purchase, so a failure is recorded on the order for a person (or the
+        // dashboard's retry) and never becomes a refund.
+        self.go_live(order, domain_id).await;
+
         log!(LogLevel::Info, "order {}: {} registered and issued", order.id, order.fqdn);
         JobOutcome::Done
+    }
+}
+
+impl Worker {
+    /// Points a freshly registered domain at the edge and, when the order named an app, attaches it.
+    ///
+    /// Best effort by design: the customer has paid and the domain exists, so nothing here may fail the
+    /// order. What could not be done is recorded in the log and in `last_error` for the operator.
+    async fn go_live(&self, order: &OrderRow, domain_id: u64) {
+        // 1. Edge A/AAAA. The challenge CNAME was already written; without these the name resolves to nothing.
+        match crate::intake::required_records(&self.config, &order.fqdn, false) {
+            Ok(records) => {
+                let mut notes = Vec::new();
+                let (_, written) =
+                    crate::dns::write::write_records(&self.config, &self.secrets, &order.fqdn, &records, &mut notes).await;
+                for note in &notes {
+                    log!(LogLevel::Info, "order {}: {note}", order.id);
+                }
+                if !written {
+                    self.note_trouble(order, "the edge A/AAAA records were not all written; add them by hand").await;
+                }
+            }
+            Err(err) => {
+                self.note_trouble(order, &format!("no edge records to write: {err}")).await;
+            }
+        }
+
+        // 2. Attach, only when the order says where the app is. The runner was authorized when the order was
+        //    created; nothing here widens that.
+        let (Some(runner_id), Some(node_id), Some(port)) = (
+            order.runner_id.as_deref().filter(|id| !id.is_empty()),
+            order.backend_node_id.as_deref().filter(|id| !id.is_empty()),
+            order.backend_port,
+        ) else {
+            if let Some(runner_id) = order.runner_id.as_deref().filter(|id| !id.is_empty()) {
+                // No backend recorded: keep the old behaviour of recording the assignment and stopping.
+                if let Err(err) =
+                    crate::db::inventory::set_assignment(&self.pool, domain_id, None, Some(Some(runner_id.to_owned())))
+                        .await
+                {
+                    log!(LogLevel::Warn, "order {}: could not record the runner assignment: {}", order.id, err);
+                }
+            }
+            return;
+        };
+
+        let mut spec = crate::vhost::render::VhostSpec::new(
+            &order.fqdn,
+            runner_id,
+            vec![crate::vhost::render::Backend::Node { node_id: node_id.to_owned(), port }],
+        );
+        spec.http_redirect = true;
+        match crate::vhost::attach_and_record(&self.config, &self.pool, domain_id, &spec).await {
+            Ok(_) => log!(LogLevel::Info, "order {}: {} attached to {runner_id}", order.id, order.fqdn),
+            Err(err) => {
+                log!(LogLevel::Warn, "order {}: attaching {} failed: {err}", order.id, order.fqdn);
+                self.note_trouble(order, &format!("the domain was bought but attaching it failed ({err}); attach it from the app page")).await;
+            }
+        }
+    }
+
+    async fn note_trouble(&self, order: &OrderRow, message: &str) {
+        log!(LogLevel::Warn, "order {}: {message}", order.id);
+        if let Err(err) = orders_db::set_last_error(&self.pool, order.id, message).await {
+            log!(LogLevel::Warn, "order {}: could not record that: {err}", order.id);
+        }
     }
 }
 

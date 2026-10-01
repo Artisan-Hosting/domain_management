@@ -43,6 +43,9 @@ pub struct OrderRow {
     pub stripe_payment_intent_id: Option<String>,
     pub domain_id: Option<u64>,
     pub runner_id: Option<String>,
+    /// Where to attach the vhost when the domain finishes; see migration 0009. Both set, or neither.
+    pub backend_node_id: Option<String>,
+    pub backend_port: Option<u16>,
     pub invite_email: Option<String>,
     pub last_error: Option<String>,
     pub created_at: i64,
@@ -338,6 +341,16 @@ pub async fn finish_order(pool: &MySqlPool, order_id: u64, domain_id: u64) -> Re
     Ok(())
 }
 
+/// A note on an order that is otherwise fine (it completed, but a follow-up step needs a person).
+pub async fn set_last_error(pool: &MySqlPool, order_id: u64, message: &str) -> Result<()> {
+    sqlx::query("UPDATE domain_orders SET last_error = ? WHERE id = ?")
+        .bind(message.chars().take(500).collect::<String>())
+        .bind(order_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn find_order(pool: &MySqlPool, id: u64) -> Result<Option<OrderRow>> {
     let row = sqlx::query(&format!("{ORDER_SELECT} WHERE id = ?")).bind(id).fetch_optional(pool).await?;
     Ok(row.map(row_to_order))
@@ -360,7 +373,7 @@ pub async fn list_orders(
 }
 
 const ORDER_SELECT: &str = "SELECT id, fqdn, organization_id, user_id, quote_id, cost_cents, price_cents, \
-     currency, state, cf_workflow_state, stripe_payment_intent_id, domain_id, runner_id, invite_email, \
+     currency, state, cf_workflow_state, stripe_payment_intent_id, domain_id, runner_id, backend_node_id, backend_port, invite_email, \
      last_error, UNIX_TIMESTAMP(created_at) AS created_at, UNIX_TIMESTAMP(updated_at) AS updated_at \
      FROM domain_orders";
 
@@ -379,11 +392,25 @@ fn row_to_order(row: sqlx::mysql::MySqlRow) -> OrderRow {
         stripe_payment_intent_id: row.get("stripe_payment_intent_id"),
         domain_id: row.get("domain_id"),
         runner_id: row.get("runner_id"),
+        backend_node_id: row.get("backend_node_id"),
+        backend_port: row.get::<Option<u32>, _>("backend_port").and_then(|p| u16::try_from(p).ok()),
         invite_email: row.get("invite_email"),
         last_error: row.get("last_error"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
+}
+
+/// Records where the finished domain's traffic should go. Separate from the insert so the order itself
+/// (and its caps and locks) is unchanged; a failure here only means no auto-attach.
+pub async fn set_backend(pool: &MySqlPool, order_id: u64, node_id: &str, port: u16) -> Result<()> {
+    sqlx::query("UPDATE domain_orders SET backend_node_id = ?, backend_port = ? WHERE id = ?")
+        .bind(node_id)
+        .bind(u32::from(port))
+        .bind(order_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 fn none_if_empty(value: &str) -> Option<&str> {

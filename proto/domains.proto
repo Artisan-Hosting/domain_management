@@ -277,6 +277,9 @@ message CreateOrderRequest {
   // Spending money needs a fresh password check, the same bar every other
   // write-that-spends-or-destroys in this service sits behind.
   string elevated_token = 6;
+  // optional, needs runner_id: where the app answers (node_id + port). When set the worker attaches
+  // the vhost the moment the domain finishes. Only the node-id form is accepted.
+  Backend backend = 7;
 }
 
 message OrderCheckout {

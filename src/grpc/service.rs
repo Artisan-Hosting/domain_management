@@ -365,88 +365,14 @@ impl Domains {
         Ok((fqdn, None))
     }
 
-    /// Writes the DNS records into the zone we hold for `fqdn`, if we hold one.
-    ///
-    /// Returns the zone id and whether everything is now in place. Never
-    /// overwrites: see [`crate::intake::plan_dns`]. Every reason it did not
-    /// write is added to `notes`.
+    /// Writes the DNS records into the zone we hold for `fqdn`, if we hold one. See [`crate::dns::write`].
     async fn write_dns(
         &self,
         fqdn: &str,
         records: &[crate::intake::RecordSpec],
         notes: &mut Vec<String>,
     ) -> (Option<String>, bool) {
-        use crate::cloudflare::{CfSuite, dns, zones};
-
-        let cf = match CfSuite::new(&self.config, &self.secrets) {
-            Ok(cf) if cf.zones.has_token() => cf,
-            Ok(_) => {
-                notes.push("No Cloudflare zones token is configured, so DNS was not written.".to_owned());
-                return (None, false);
-            }
-            Err(err) => {
-                notes.push(format!("Cloudflare is unavailable ({err}), so DNS was not written."));
-                return (None, false);
-            }
-        };
-
-        let Some(apex) = crate::inventory::model::registrable_domain(fqdn) else {
-            return (None, false);
-        };
-        let zone = match zones::find(&cf.zones, &apex).await {
-            Ok(Some(zone)) => zone,
-            Ok(None) => {
-                notes.push(format!("We hold no Cloudflare zone for {apex}, so DNS was not written."));
-                return (None, false);
-            }
-            Err(err) => {
-                log!(LogLevel::Warn, "zone lookup for {apex} failed: {err}");
-                notes.push(format!("Looking up the Cloudflare zone for {apex} failed, so DNS was not written."));
-                return (None, false);
-            }
-        };
-
-        let mut existing = Vec::new();
-        let mut names: Vec<&str> = records.iter().map(|r| r.name.as_str()).collect();
-        names.sort_unstable();
-        names.dedup();
-        for name in names {
-            match dns::list(&cf.zones, &zone.id, None, Some(name)).await {
-                Ok(found) => existing.extend(found.into_iter().map(|r| crate::intake::ExistingRecord {
-                    record_type: r.record_type,
-                    name: r.name,
-                    content: r.content,
-                })),
-                Err(err) => {
-                    log!(LogLevel::Warn, "listing {name} in {apex} failed: {err}");
-                    notes.push(format!("Reading existing DNS for {name} failed, so nothing was written."));
-                    return (Some(zone.id), false);
-                }
-            }
-        }
-
-        let plan = crate::intake::plan_dns(records, &existing);
-        if !plan.conflicts.is_empty() {
-            notes.extend(plan.conflicts.iter().map(|c| format!("Not written: {c}.")));
-            return (Some(zone.id), false);
-        }
-
-        for record in &plan.create {
-            // DNS-only: the edge terminates TLS with our certificates, and a
-            // proxied record would put Cloudflare's certificate in front.
-            if let Err(err) = dns::create(&cf.zones, &zone.id, record.record_type, &record.name, &record.content, 1, Some(false)).await {
-                log!(LogLevel::Warn, "creating {} {} failed: {err}", record.record_type, record.name);
-                notes.push(format!("Creating {} {} failed ({err}); create the remaining records by hand.", record.record_type, record.name));
-                return (Some(zone.id), false);
-            }
-        }
-
-        notes.push(format!(
-            "DNS: created {} record(s), {} already correct, in the {apex} zone.",
-            plan.create.len(),
-            plan.present.len()
-        ));
-        (Some(zone.id), true)
+        crate::dns::write::write_records(&self.config, &self.secrets, fqdn, records, notes).await
     }
 
     async fn add_domain_response(
@@ -522,27 +448,7 @@ impl Domains {
         spec.cors = extras.cors;
         spec.extra_locations = extras.extra_locations;
 
-        let outcome = crate::vhost::attach(&self.config, &spec).await?;
-
-        let server_names = spec.server_names();
-        inventory_db::record_generated_vhost(
-            &self.pool,
-            existing.id,
-            runner_id,
-            &self
-                .config
-                .vhost_path_for(&existing.fqdn)
-                .strip_prefix(&self.config.tree.root)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            &server_names,
-        )
-        .await
-        .map_err(Status::from)?;
-
-        inventory_db::set_assignment(&self.pool, existing.id, None, Some(Some(runner_id.to_owned())))
-            .await
-            .map_err(Status::from)?;
+        let outcome = crate::vhost::attach_and_record(&self.config, &self.pool, existing.id, &spec).await?;
 
         log!(
             LogLevel::Info,
@@ -984,6 +890,25 @@ impl DomainService for Domains {
         let charge_org =
             if claims.role == Role::Super && !req.organization_id.is_empty() { req.organization_id } else { caller_org };
 
+        // AUTHZ: naming an app to attach the domain to is a write on that app, decided by `ais_auth` exactly
+        // as AttachDomain does. Without this an Admin could aim a domain they buy at someone else's runner,
+        // and the worker now attaches it for them when it finishes.
+        let backend = match req.backend.clone() {
+            Some(_) if req.runner_id.is_empty() => {
+                return Err(Status::invalid_argument("a backend needs the runner_id it belongs to"));
+            }
+            Some(backend) => match backend_from_proto(backend)? {
+                crate::vhost::render::Backend::Node { node_id, port } => Some((node_id, port)),
+                crate::vhost::render::Backend::Static { .. } => {
+                    return Err(Status::invalid_argument("an order's backend must be a node_id and port"));
+                }
+            },
+            None => None,
+        };
+        if !req.runner_id.is_empty() && self.may_write_runner(&claims, &req.runner_id).await? == Some(false) {
+            return Err(Status::permission_denied("not permitted to change that app"));
+        }
+
         // Fail closed: a purchase-shaped action refuses outright if Billing
         // can't even be asked whether this org is in good standing, rather
         // than assuming "fine" and letting a suspended (or unreachable-to-check)
@@ -1059,6 +984,13 @@ impl DomainService for Domains {
             .await
             .map_err(Status::from)?
             .ok_or_else(|| Status::internal("order vanished mid-create"))?;
+
+        if let Some((node_id, port)) = backend {
+            // Only means "no auto-attach" if it fails, so it is logged rather than failing a paid-for order.
+            if let Err(err) = orders_db::set_backend(&self.pool, order_id, &node_id, port).await {
+                log!(LogLevel::Warn, "order {order_id}: could not record the backend: {err}");
+            }
+        }
 
         log!(LogLevel::Info, "{}: order {} created ({}c)", order.fqdn, order_id, order.price_cents);
 
