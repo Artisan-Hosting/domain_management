@@ -233,6 +233,16 @@ impl Worker {
         JobOutcome::Done
     }
 
+    /// The registration is known not to have happened: write that down first,
+    /// then refund. If the refund fails and the job retries, the order is
+    /// already marked `failed` and the retry only repeats the refund.
+    async fn fail_registration_and_refund(&self, order: &OrderRow, reason: &str) -> JobOutcome {
+        if let Err(err) = orders_db::record_registration_failure(&self.pool, order.id, reason).await {
+            return JobOutcome::Failed(format!("order {}: could not record the failed registration: {err}", order.id));
+        }
+        self.refund_and_close(order, reason).await
+    }
+
     /// Re-checks the registry's real-time price right before buying.
     async fn recheck_cost(&self, order: &OrderRow, cf: &CfSuite) -> Result<(), Recheck> {
         let answers = registrar::check(&cf.registrar, &cf.account_id, &[order.fqdn.clone()])
@@ -280,13 +290,23 @@ impl Worker {
             match registrar::register(&cf.registrar, &cf.account_id, &request, true).await {
                 Ok(result) => result,
                 Err(err) if definitely_not_registered(&err) => {
-                    return self.refund_and_close(order, &format!("the registrar refused the registration: {err}")).await;
+                    return self
+                        .fail_registration_and_refund(order, &format!("the registrar refused the registration: {err}"))
+                        .await;
                 }
                 // Timeout, 5xx, undecodable: the purchase may or may not have
                 // happened. It is recorded as requested, so the next run
                 // *polls* for it and never buys again.
                 Err(err) => return JobOutcome::Failed(format!("order {}: registrar purchase: {err}", order.id)),
             }
+        } else if order.cf_workflow_state.as_deref() == Some("failed") {
+            // An earlier run established the registration failed and was
+            // refunding when it stopped (the refund itself failed). Go straight
+            // back to the refund: polling the registrar again would find no
+            // registration, fail the same way, and end up needing an admin
+            // for an order that only needs its refund retried.
+            let reason = order.last_error.clone().unwrap_or_else(|| "the registration failed".to_owned());
+            return self.refund_and_close(order, &reason).await;
         } else {
             match registrar::registration_status(&cf.registrar, &cf.account_id, &order.fqdn).await {
                 Ok(result) => result,
@@ -294,8 +314,13 @@ impl Worker {
             }
         };
 
-        if let Err(err) = orders_db::set_cf_workflow_state(&self.pool, order.id, registration.state.as_str()).await {
-            log!(LogLevel::Warn, "order {}: could not record workflow state: {}", order.id, err);
+        // `failed` is recorded together with its reason in the failure branch
+        // below, which must succeed before the refund; every other state is
+        // only a progress note.
+        if registration.state != RegistrationState::Failed {
+            if let Err(err) = orders_db::set_cf_workflow_state(&self.pool, order.id, registration.state.as_str()).await {
+                log!(LogLevel::Warn, "order {}: could not record workflow state: {}", order.id, err);
+            }
         }
 
         match registration.state {
@@ -305,7 +330,7 @@ impl Worker {
                     .error
                     .map(|e| e.message)
                     .unwrap_or_else(|| "the registry declined this registration".to_owned());
-                self.refund_and_close(order, &message).await
+                self.fail_registration_and_refund(order, &message).await
             }
             // The registry wants something a person has to do (contact
             // verification, a block). The customer's money stays put until

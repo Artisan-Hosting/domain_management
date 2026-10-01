@@ -7,6 +7,7 @@
 
 use sqlx::{MySqlPool, Row};
 
+use crate::config::Purchasing;
 use crate::error::Result;
 
 #[derive(Debug, Clone)]
@@ -102,16 +103,28 @@ pub async fn find_quote(pool: &MySqlPool, id: &str) -> Result<Option<QuoteRow>> 
     }))
 }
 
+/// What [`insert_order_with_job`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NewOrder {
+    Created(u64),
+    /// The organization is at its daily order count or monthly spend cap.
+    CapReached,
+}
+
 /// Records a new order in `awaiting_payment` **and** queues its `register`
 /// job, in one transaction: an order with no job would sit waiting for a
 /// payment nothing ever checks, and a job with no order is meaningless.
-/// Returns the new order's id.
+///
+/// The organization's spending caps are checked inside the same transaction,
+/// under a per-organization lock, so concurrent orders cannot each pass a cap
+/// that together they would exceed.
 ///
 /// A duplicate quote or a name already being bought fails on the unique
 /// keys from migration 0007; see [`is_duplicate`].
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_order_with_job(
     pool: &MySqlPool,
+    purchasing: &Purchasing,
     fqdn: &str,
     organization_id: &str,
     user_id: &str,
@@ -121,8 +134,43 @@ pub async fn insert_order_with_job(
     currency: &str,
     runner_id: &str,
     invite_email: &str,
-) -> Result<u64> {
-    let mut tx = pool.begin().await?;
+) -> Result<NewOrder> {
+    // A named lock belongs to the connection that took it, so everything
+    // below runs on this one connection and the lock is released on it.
+    let mut conn = pool.acquire().await?;
+    lock_org_orders(&mut *conn, organization_id).await?;
+    let outcome = insert_locked(
+        &mut *conn, purchasing, fqdn, organization_id, user_id, quote_id, cost_cents, price_cents, currency, runner_id,
+        invite_email,
+    )
+    .await;
+    // Released whatever happened above. If this fails the connection is
+    // dropped from the pool's reuse by closing it, which frees the lock.
+    if unlock_org_orders(&mut *conn, organization_id).await.is_err() {
+        let _ = conn.close_on_drop();
+    }
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_locked(
+    conn: &mut sqlx::MySqlConnection,
+    purchasing: &Purchasing,
+    fqdn: &str,
+    organization_id: &str,
+    user_id: &str,
+    quote_id: &str,
+    cost_cents: i64,
+    price_cents: i64,
+    currency: &str,
+    runner_id: &str,
+    invite_email: &str,
+) -> Result<NewOrder> {
+    if !crate::purchasing::under_caps(&mut *conn, organization_id, price_cents, purchasing).await? {
+        return Ok(NewOrder::CapReached);
+    }
+
+    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
 
     let result = sqlx::query(
         "INSERT INTO domain_orders \
@@ -149,7 +197,35 @@ pub async fn insert_order_with_job(
         .await?;
 
     tx.commit().await?;
-    Ok(order_id)
+    Ok(NewOrder::Created(order_id))
+}
+
+/// How long an order waits for another order of the same organization to
+/// finish being recorded. Recording is a handful of statements, so this is
+/// only ever hit if something is badly stuck.
+const ORG_LOCK_WAIT_SECS: i64 = 10;
+
+/// The lock name is hashed: MySQL caps names at 64 characters.
+async fn lock_org_orders(conn: &mut sqlx::MySqlConnection, organization_id: &str) -> Result<()> {
+    let got: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(CONCAT('dm_orders:', MD5(?)), ?)")
+        .bind(organization_id)
+        .bind(ORG_LOCK_WAIT_SECS)
+        .fetch_one(&mut *conn)
+        .await?;
+    if got != Some(1) {
+        return Err(crate::error::Error::Invalid(
+            "another order for this organization is being recorded; try again".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn unlock_org_orders(conn: &mut sqlx::MySqlConnection, organization_id: &str) -> Result<()> {
+    sqlx::query("SELECT RELEASE_LOCK(CONCAT('dm_orders:', MD5(?)))")
+        .bind(organization_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
 }
 
 /// Whether `err` is MySQL's duplicate-key error (1062).
@@ -177,6 +253,19 @@ pub async fn find_live_order_for_fqdn(pool: &MySqlPool, fqdn: &str) -> Result<Op
 /// an order an admin has to look at.
 pub async fn begin_registration(pool: &MySqlPool, order_id: u64) -> Result<()> {
     sqlx::query("UPDATE domain_orders SET state = 'registering', cf_workflow_state = 'requested' WHERE id = ?")
+        .bind(order_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The registry has definitively not registered this name (it refused, or
+/// reported failure). Written **before** the refund is attempted, so a refund
+/// that fails and is retried goes straight back to refunding instead of
+/// polling the registrar for a registration that will never exist.
+pub async fn record_registration_failure(pool: &MySqlPool, order_id: u64, reason: &str) -> Result<()> {
+    sqlx::query("UPDATE domain_orders SET cf_workflow_state = 'failed', last_error = ? WHERE id = ?")
+        .bind(reason)
         .bind(order_id)
         .execute(pool)
         .await?;

@@ -929,13 +929,6 @@ impl DomainService for Domains {
             return Err(Status::permission_denied("this quote does not belong to this organization"));
         }
 
-        let within_caps = purchasing::under_caps(&self.pool, &charge_org, quote.price_cents, &self.config.purchasing)
-            .await
-            .map_err(Status::from)?;
-        if !within_caps {
-            return Err(Status::resource_exhausted("purchasing cap reached for this organization"));
-        }
-
         // One order per quote: a double submit (a double click, a retried
         // request) gets the order the first one made, not a second order and a
         // second charge.
@@ -949,8 +942,11 @@ impl DomainService for Domains {
             return Err(Status::already_exists(format!("{} is already registered here", quote.fqdn)));
         }
 
+        // The spending caps are checked inside this call, under a lock on the
+        // organization, so concurrent orders cannot each slip under a cap.
         let order_id = match orders_db::insert_order_with_job(
             &self.pool,
+            &self.config.purchasing,
             &quote.fqdn,
             &charge_org,
             &claims.sub,
@@ -963,7 +959,10 @@ impl DomainService for Domains {
         )
         .await
         {
-            Ok(id) => id,
+            Ok(orders_db::NewOrder::Created(id)) => id,
+            Ok(orders_db::NewOrder::CapReached) => {
+                return Err(Status::resource_exhausted("purchasing cap reached for this organization"));
+            }
             Err(err) if orders_db::is_duplicate(&err) => {
                 // Lost a race: either the same quote was submitted at the
                 // same instant, or another order is already buying this name.
