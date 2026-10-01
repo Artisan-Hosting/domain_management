@@ -80,6 +80,14 @@ service DomainService {
   rpc ForceRenew(ForceRenewRequest) returns (ForceRenewResponse);
   rpc PublishNow(PublishNowRequest) returns (Release);
   rpc ListReleases(ListReleasesRequest) returns (ListReleasesResponse);
+
+  // --- free zone: reserved names (Super only) -------------------------
+  //
+  // Names nobody may claim as a free `<name>.<free zone>` address. Platform-wide, so an operator's
+  // call, never an organization's.
+  rpc ListReservedNames(ListReservedNamesRequest) returns (ListReservedNamesResponse);
+  rpc AddReservedName(AddReservedNameRequest) returns (ReservedName);
+  rpc RemoveReservedName(RemoveReservedNameRequest) returns (RemoveReservedNameResponse);
 }
 
 // ---------------------------------------------------------------------
@@ -742,4 +750,54 @@ message ConvertVhostRequest {
 message ConvertVhostResponse {
   string diff = 1;
   bool converted = 2;
+}
+
+// ---------------------------------------------------------------------
+// Reserved names on the free zone
+// ---------------------------------------------------------------------
+
+// One reservation. `kind` picks which other fields mean anything:
+//   "exact"  -> `prefix` is the whole label
+//   "prefix" -> `prefix` is the start of the label
+//   "range"  -> `prefix`, then `digits` ASCII digits whose value is min_value..=max_value
+// (c00000000-c99999999 is kind "range", prefix "c", digits 8, min 0, max 99999999.)
+message ReservedName {
+  int64 id = 1;
+  string kind = 2;
+  string prefix = 3;
+  int32 digits = 4;
+  int64 min_value = 5;
+  int64 max_value = 6;
+  string note = 7;
+  string created_by = 8;
+  int64 created_at = 9;
+}
+
+message ListReservedNamesRequest {
+  string access_token = 1;
+}
+
+message ListReservedNamesResponse {
+  repeated ReservedName rules = 1;
+  // The zone the rules apply to, so an operator screen can show `c00000000.<free_zone>`.
+  string free_zone = 2;
+}
+
+message AddReservedNameRequest {
+  string access_token = 1;
+  string kind = 2;
+  string prefix = 3;
+  int32 digits = 4;
+  int64 min_value = 5;
+  int64 max_value = 6;
+  string note = 7;
+}
+
+message RemoveReservedNameRequest {
+  string access_token = 1;
+  int64 id = 2;
+}
+
+message RemoveReservedNameResponse {
+  bool removed = 1;
 }

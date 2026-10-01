@@ -47,6 +47,7 @@ use crate::db::dns_records as dns_records_db;
 use crate::db::domains as domains_db;
 use crate::db::inventory as inventory_db;
 use crate::db::orders as orders_db;
+use crate::db::reserved as reserved_db;
 use crate::db::releases as releases_db;
 use crate::inventory::scan;
 use crate::purchasing;
@@ -539,6 +540,51 @@ impl Domains {
 /// build if a marker goes missing. The notes are the RBAC Phase 6 mapping.
 fn pending(phase: &str, what: &str) -> Status {
     Status::unimplemented(format!("{what} lands in {phase}"))
+}
+
+fn require_super(role: Role, what: &str) -> Result<(), Status> {
+    if role != Role::Super {
+        return Err(Status::permission_denied(format!("{what} requires a super user")));
+    }
+    Ok(())
+}
+
+fn reserved_rule_from_request(req: &AddReservedNameRequest) -> Result<crate::reserved::Rule, Status> {
+    use crate::reserved::Rule;
+    let prefix = req.prefix.trim().to_owned();
+    let rule = match req.kind.as_str() {
+        "exact" => Rule::Exact(prefix),
+        "prefix" => Rule::Prefix(prefix),
+        "range" => Rule::Range {
+            prefix,
+            digits: u8::try_from(req.digits).map_err(|_| Status::invalid_argument("digits must be between 1 and 18"))?,
+            min: u64::try_from(req.min_value).map_err(|_| Status::invalid_argument("min_value must not be negative"))?,
+            max: u64::try_from(req.max_value).map_err(|_| Status::invalid_argument("max_value must not be negative"))?,
+        },
+        other => return Err(Status::invalid_argument(format!("kind must be exact, prefix or range, not {other:?}"))),
+    };
+    rule.validate().map_err(|e| Status::invalid_argument(e.to_string()))?;
+    Ok(rule)
+}
+
+fn reserved_response(row: reserved_db::ReservedRow) -> ReservedName {
+    use crate::reserved::Rule;
+    let (kind, prefix, digits, min, max) = match row.rule {
+        Rule::Exact(s) => ("exact", s, 0, 0, 0),
+        Rule::Prefix(s) => ("prefix", s, 0, 0, 0),
+        Rule::Range { prefix, digits, min, max } => ("range", prefix, i32::from(digits), min, max),
+    };
+    ReservedName {
+        id: row.id as i64,
+        kind: kind.to_owned(),
+        prefix,
+        digits,
+        min_value: min as i64,
+        max_value: max as i64,
+        note: row.note,
+        created_by: row.created_by.unwrap_or_default(),
+        created_at: row.created_at,
+    }
 }
 
 /// Database strings to proto enums. Anything unrecognised maps to
@@ -2399,6 +2445,59 @@ impl DomainService for Domains {
         }))
     }
 
+    async fn list_reserved_names(
+        &self,
+        request: Request<ListReservedNamesRequest>,
+    ) -> Result<Response<ListReservedNamesResponse>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+        // Reservations are platform-wide policy about a zone the platform owns; no organization has a say.
+        require_super(claims.role, "reading reserved names")?;
+
+        let rows = reserved_db::list(&self.pool).await.map_err(Status::from)?;
+        Ok(Response::new(ListReservedNamesResponse {
+            rules: rows.into_iter().map(reserved_response).collect(),
+            free_zone: self.config.free_zone.zone.clone(),
+        }))
+    }
+
+    async fn add_reserved_name(
+        &self,
+        request: Request<AddReservedNameRequest>,
+    ) -> Result<Response<ReservedName>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+        // Reserving a name stops every customer from claiming it: an operator's call.
+        require_super(claims.role, "reserving a name")?;
+
+        let rule = reserved_rule_from_request(&req)?;
+        let id = reserved_db::add(&self.pool, &rule, &req.note, &claims.sub).await.map_err(Status::from)?;
+        let row = reserved_db::list(&self.pool)
+            .await
+            .map_err(Status::from)?
+            .into_iter()
+            .find(|r| r.id == id)
+            .ok_or_else(|| Status::internal("reservation vanished after it was stored"))?;
+        Ok(Response::new(reserved_response(row)))
+    }
+
+    async fn remove_reserved_name(
+        &self,
+        request: Request<RemoveReservedNameRequest>,
+    ) -> Result<Response<RemoveReservedNameResponse>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+        // Lifting a reservation lets customers claim the names it covered: an operator's call.
+        require_super(claims.role, "lifting a reservation")?;
+
+        let id = u64::try_from(req.id).map_err(|_| Status::invalid_argument("id must be positive"))?;
+        let removed = reserved_db::remove(&self.pool, id).await.map_err(Status::from)?;
+        if !removed {
+            return Err(Status::not_found("no such reservation"));
+        }
+        Ok(Response::new(RemoveReservedNameResponse { removed }))
+    }
+
     async fn list_adopted_vhosts(
         &self,
         request: Request<ListAdoptedVhostsRequest>,
@@ -2709,6 +2808,38 @@ mod authorization_contracts {
         );
     }
 
+    fn add_req(kind: &str, prefix: &str, digits: i32, min: i64, max: i64) -> AddReservedNameRequest {
+        AddReservedNameRequest { kind: kind.into(), prefix: prefix.into(), digits, min_value: min, max_value: max, ..Default::default() }
+    }
+
+    #[test]
+    fn a_reserved_name_request_maps_to_a_rule_and_bad_ones_are_invalid_argument() {
+        use crate::reserved::Rule;
+        assert_eq!(
+            reserved_rule_from_request(&add_req("range", "c", 8, 0, 99_999_999)).unwrap(),
+            Rule::Range { prefix: "c".into(), digits: 8, min: 0, max: 99_999_999 }
+        );
+        assert_eq!(reserved_rule_from_request(&add_req("exact", " www ", 0, 0, 0)).unwrap(), Rule::Exact("www".into()));
+        for bad in [
+            add_req("regex", "c.*", 0, 0, 0),
+            add_req("range", "c", 300, 0, 1),
+            add_req("range", "c", 8, -1, 5),
+            add_req("range", "c", 3, 0, 1000),
+            add_req("exact", "Has Space", 0, 0, 0),
+        ] {
+            let status = reserved_rule_from_request(&bad).unwrap_err();
+            assert_eq!(status.code(), Code::InvalidArgument, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_super_may_change_reservations() {
+        for role in [Role::Admin, Role::Controller, Role::Viewer, Role::Audit, Role::None] {
+            assert_eq!(require_super(role, "x").unwrap_err().code(), Code::PermissionDenied);
+        }
+        assert!(require_super(Role::Super, "x").is_ok());
+    }
+
     fn service() -> Domains {
         // Nothing here touches the database or ais_auth: every RPC below
         // rejects an empty token before reading anything else. A lazy pool
@@ -2813,6 +2944,18 @@ mod authorization_contracts {
             ("force_renew", service.force_renew(Request::new(ForceRenewRequest::default())).await.err()),
             ("publish_now", service.publish_now(Request::new(PublishNowRequest::default())).await.err()),
             ("list_releases", service.list_releases(Request::new(ListReleasesRequest::default())).await.err()),
+            (
+                "list_reserved_names",
+                service.list_reserved_names(Request::new(ListReservedNamesRequest::default())).await.err(),
+            ),
+            (
+                "add_reserved_name",
+                service.add_reserved_name(Request::new(AddReservedNameRequest::default())).await.err(),
+            ),
+            (
+                "remove_reserved_name",
+                service.remove_reserved_name(Request::new(RemoveReservedNameRequest::default())).await.err(),
+            ),
         ] {
             let status = status.unwrap_or_else(|| panic!("{name}: no token is not a valid request"));
             assert_eq!(status.code(), Code::Unauthenticated, "{name}: {}", status.message());

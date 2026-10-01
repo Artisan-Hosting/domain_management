@@ -49,6 +49,22 @@ pub struct Config {
     pub publish: Publish,
     pub pricing: Pricing,
     pub purchasing: Purchasing,
+    pub free_zone: FreeZone,
+}
+
+/// The zone the platform hands free `<name>.<zone>` addresses out of. Infrastructure, so it lives here
+/// and not in the database; what may not be claimed on it lives in `reserved_names`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FreeZone {
+    /// Empty turns free addresses off.
+    pub zone: String,
+}
+
+impl Default for FreeZone {
+    fn default() -> Self {
+        Self { zone: String::new() }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,6 +254,7 @@ impl Default for Config {
             publish: Publish::default(),
             pricing: Pricing::default(),
             purchasing: Purchasing::default(),
+            free_zone: FreeZone::default(),
         }
     }
 }
