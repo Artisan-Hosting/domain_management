@@ -2553,6 +2553,45 @@ impl DomainService for Domains {
         }))
     }
 
+    /// AUTHZ: `authz::scope` -- the same scoping as `ListAdoptedVhosts`, so a
+    /// caller can read exactly the files they could already see listed. The
+    /// requested path is only compared against those rows and the row's own
+    /// recorded path is what gets read; a path that is not in the list
+    /// (`../etc/passwd`, an absolute path, another org's file) is `not_found`
+    /// and never reaches the filesystem.
+    async fn get_adopted_vhost_content(
+        &self,
+        request: Request<GetAdoptedVhostContentRequest>,
+    ) -> Result<Response<GetAdoptedVhostContentResponse>, Status> {
+        /// A vhost is a few KiB; anything past this is not one.
+        const MAX_BYTES: usize = 1024 * 1024;
+
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+        let scope = authz::scope(claims.role, &claims.organization_id, "")?;
+
+        let rows = inventory_db::list_adopted_vhosts(&self.pool, scope.as_deref())
+            .await
+            .map_err(Status::from)?;
+        let row = rows
+            .into_iter()
+            .find(|row| row.path == req.path)
+            .ok_or_else(|| Status::not_found("no adopted vhost at that path"))?;
+
+        let bytes = std::fs::read(self.config.tree.root.join(&row.path))
+            .map_err(|_| Status::not_found("that vhost is no longer on disk"))?;
+        if bytes.len() > MAX_BYTES {
+            return Err(Status::failed_precondition("that file is too large to be a vhost"));
+        }
+
+        use sha2::{Digest, Sha256};
+        Ok(Response::new(GetAdoptedVhostContentResponse {
+            path: row.path,
+            file_sha256: hex::encode(Sha256::digest(&bytes)),
+            content: String::from_utf8_lossy(&bytes).into_owned(),
+        }))
+    }
+
     /// Brings a hand-written, currently-untracked vhost under this
     /// service's tracking. The file's existing text is run through the same
     /// validate/apply pipeline as `ApplyFreeformVhost`: it is mechanically
