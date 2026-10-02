@@ -258,10 +258,7 @@ R2 publish, and the whole adoption path above -- scanner, findings, plan file,
 apply, quarantine, plus the `AssignDomain` / `ListInventory` / `ListFindings` /
 `RescanInventory` / `ListAdoptedVhosts` RPCs.
 
-**Not wired yet:** Portal's `/v1/domains/*` routes and the dashboard view, so
-attachment is CLI- and gRPC-only for now. `ConvertVhost` waits on the vhost
-template work. The purchasing RPCs (Cloudflare Registrar, Stripe, zone
-invites) return `unimplemented` naming their phase.
+**Not wired yet:** the dashboard still calls some `/v1/domains/*` routes that Portal does not serve (certificates, DNS records, members, freeform vhosts) -- see the Portal API docs for what is exposed.
 
 **Blocked on access to the running systems** (phase 0 in the plan):
 

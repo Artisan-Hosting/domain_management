@@ -20,11 +20,8 @@
 //!   worker described in [the crate root doc][crate] (subsystem 3), never
 //!   run from inside a handler here.
 //!
-//! Phase 1 is the script-parity work (issuance and publishing); the RPCs that
-//! are not wired yet return `unimplemented` rather than pretending. See each
-//! stub's `AUTHZ:` comment for the authorization it will need once its body
-//! is written -- those notes are RBAC Phase 6's mapping, meant to be reused
-//! verbatim rather than re-derived.
+//! Every RPC in the service is implemented. Each handler's `AUTHZ:` comment
+//! records the authorization it enforces (RBAC Phase 6's mapping).
 
 use artisan_middleware::api::claims::Claims;
 use artisan_middleware::dusa_collection_utils::core::logger::LogLevel;
@@ -465,19 +462,6 @@ impl Domains {
 
         Ok(())
     }
-}
-
-/// Marks an RPC whose implementation is still ahead of us, with the phase it
-/// belongs to, so a caller gets a straight answer instead of a stub result.
-///
-/// **Every call site carries an `AUTHZ:` note** saying which check has to be
-/// written when the body is. The authorization is the part that is easy to
-/// forget once the business logic is the interesting problem, and a stub that
-/// grows a body without one is a hole that ships quietly --
-/// `authorization_contracts::every_stub_documents_its_authorization` fails the
-/// build if a marker goes missing. The notes are the RBAC Phase 6 mapping.
-fn pending(phase: &str, what: &str) -> Status {
-    Status::unimplemented(format!("{what} lands in {phase}"))
 }
 
 fn require_super(role: Role, what: &str) -> Result<(), Status> {
@@ -2569,13 +2553,57 @@ impl DomainService for Domains {
         }))
     }
 
+    /// AUTHZ: `authz::scope` -- the same scoping as `ListAdoptedVhosts`, so a
+    /// caller can read exactly the files they could already see listed. The
+    /// requested path is only compared against those rows and the row's own
+    /// recorded path is what gets read; a path that is not in the list
+    /// (`../etc/passwd`, an absolute path, another org's file) is `not_found`
+    /// and never reaches the filesystem.
+    async fn get_adopted_vhost_content(
+        &self,
+        request: Request<GetAdoptedVhostContentRequest>,
+    ) -> Result<Response<GetAdoptedVhostContentResponse>, Status> {
+        /// A vhost is a few KiB; anything past this is not one.
+        const MAX_BYTES: usize = 1024 * 1024;
+
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+        let scope = authz::scope(claims.role, &claims.organization_id, "")?;
+
+        let rows = inventory_db::list_adopted_vhosts(&self.pool, scope.as_deref())
+            .await
+            .map_err(Status::from)?;
+        let row = rows
+            .into_iter()
+            .find(|row| row.path == req.path)
+            .ok_or_else(|| Status::not_found("no adopted vhost at that path"))?;
+
+        let bytes = std::fs::read(self.config.tree.root.join(&row.path))
+            .map_err(|_| Status::not_found("that vhost is no longer on disk"))?;
+        if bytes.len() > MAX_BYTES {
+            return Err(Status::failed_precondition("that file is too large to be a vhost"));
+        }
+
+        use sha2::{Digest, Sha256};
+        Ok(Response::new(GetAdoptedVhostContentResponse {
+            path: row.path,
+            file_sha256: hex::encode(Sha256::digest(&bytes)),
+            content: String::from_utf8_lossy(&bytes).into_owned(),
+        }))
+    }
+
     /// Brings a hand-written, currently-untracked vhost under this
-    /// service's tracking. `template = "structured"` would recognize it as a
-    /// [`crate::vhost::render::VhostSpec`] and re-render it -- that
-    /// heuristic recognizer is not built yet, so only the freeform path
-    /// (the common case) is implemented: the file's exact existing text is
-    /// run through the same validate/apply pipeline as
-    /// `ApplyFreeformVhost`, changing only its tracking, not its directives.
+    /// service's tracking. The file's existing text is run through the same
+    /// validate/apply pipeline as `ApplyFreeformVhost`: it is mechanically
+    /// standardized (indentation, statement terminators, snippet slug) and
+    /// stamped with the freeform tag, and its directives are otherwise left
+    /// exactly as written.
+    ///
+    /// `template = "structured"` is accepted and does the same thing. It does
+    /// not recognize the file as a [`crate::vhost::render::VhostSpec`], and
+    /// deliberately does not use `MANAGED_HEADER`: that tag lets the
+    /// structured renderer overwrite the file, which would discard anyone's
+    /// hand-written directives on a guess.
     async fn convert_vhost(
         &self,
         request: Request<ConvertVhostRequest>,
@@ -2598,13 +2626,6 @@ impl DomainService for Domains {
         let runner = self.may_write_runner(&claims, existing.runner_id.as_deref().unwrap_or("")).await?;
         authz::may_write_domain(claims.role, &claims.organization_id, existing.organization_id.as_deref(), runner)
             .map_err(|denial| denial.into_status(&existing.fqdn))?;
-
-        if req.template == "structured" {
-            return Err(pending(
-                "the vhost template work",
-                "recognizing a hand-written vhost as a structured VhostSpec",
-            ));
-        }
 
         let path = self.config.vhost_path_for(&existing.fqdn);
         let current = std::fs::read_to_string(&path)
@@ -2771,68 +2792,13 @@ impl DomainService for Domains {
     }
 }
 
-/// What's left of Phase 6's stub-tracking tests, now that Phase 7 landed
-/// every RPC that used to be tracked here (see the crate's rollout plan).
-///
-/// `the_unimplemented_rpcs_say_so_rather_than_answering` -- the test that
-/// asserted a whole list of RPCs still answered `unimplemented` -- is gone
-/// per that plan's own Phase 8 note ("delete when done, not patch the
-/// count"): there is nothing left in `DomainService` for it to track.
-/// `every_stub_documents_its_authorization` survives in a smaller form: one
-/// `pending()` call site remains (`convert_vhost`'s `template == "structured"`
-/// branch, a real, still-unbuilt feature, not a placeholder for an RPC that
-/// doesn't exist yet), and it still deserves its own AUTHZ note.
+/// Authorization contracts for the RPCs that gate on role. There are no stubs
+/// left in `DomainService`, so the old stub-tracking tests are gone.
 #[cfg(test)]
 mod authorization_contracts {
     use super::*;
     use std::path::Path;
     use tonic::Code;
-
-    /// Every `pending()` call site carries an `AUTHZ:` note within the handful
-    /// of lines above it.
-    #[test]
-    fn every_stub_documents_its_authorization() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/grpc/service.rs");
-        let source = std::fs::read_to_string(&path).expect("read service.rs");
-        // Only the handlers: everything from `#[cfg(test)]` down is this module
-        // talking about itself.
-        let source = source.split("#[cfg(test)]").next().unwrap_or_default();
-        let lines: Vec<&str> = source.lines().collect();
-
-        let mut undocumented = Vec::new();
-        let mut call_sites = 0;
-        for (n, line) in lines.iter().enumerate() {
-            let code = line.trim_start();
-            // A call, not the definition and not prose about it.
-            if code.starts_with("//") || code.starts_with("fn pending(") || !code.contains("pending(")
-            {
-                continue;
-            }
-            call_sites += 1;
-
-            // Back to the top of *this* handler, never further: a fixed-size
-            // window lets one stub borrow the note belonging to the one above
-            // it, which is exactly the mistake this test exists to catch.
-            let start = lines[..n]
-                .iter()
-                .rposition(|above| above.contains("async fn "))
-                .map(|at| at + 1)
-                .unwrap_or(0);
-            if !lines[start..n].iter().any(|above| above.contains("AUTHZ:")) {
-                undocumented.push(format!("{}: {}", n + 1, line.trim()));
-            }
-        }
-
-        // Just `convert_vhost`'s "structured" branch now that Phase 7 landed
-        // every RPC-level stub -- update this the moment that lands too,
-        // rather than letting it drift from reality.
-        assert_eq!(call_sites, 1, "expected exactly convert_vhost's remaining pending() call, found {call_sites}");
-        assert!(
-            undocumented.is_empty(),
-            "these stubs do not say what authorization they will need:\n{}",
-            undocumented.join("\n")
-        );
-    }
 
     fn add_req(kind: &str, prefix: &str, digits: i32, min: i64, max: i64) -> AddReservedNameRequest {
         AddReservedNameRequest { kind: kind.into(), prefix: prefix.into(), digits, min_value: min, max_value: max, ..Default::default() }

@@ -74,6 +74,8 @@ service DomainService {
   rpc RescanInventory(RescanRequest) returns (RescanResponse);
   rpc ListAdoptedVhosts(ListAdoptedVhostsRequest) returns (ListAdoptedVhostsResponse);
   rpc ConvertVhost(ConvertVhostRequest) returns (ConvertVhostResponse);
+  // The text of one adopted vhost, so a person can read it before converting or editing it.
+  rpc GetAdoptedVhostContent(GetAdoptedVhostContentRequest) returns (GetAdoptedVhostContentResponse);
 
   // --- ops (Admin/Super) ----------------------------------------------
   rpc ListCertificates(ListCertificatesRequest) returns (ListCertificatesResponse);
@@ -747,6 +749,19 @@ message ListAdoptedVhostsRequest {
 
 message ListAdoptedVhostsResponse {
   repeated AdoptedVhost vhosts = 1;
+}
+
+// `path` is only ever matched against the adopted-vhost rows the caller may list; it is never
+// joined onto the tree root as given.
+message GetAdoptedVhostContentRequest {
+  string access_token = 1;
+  string path = 2;
+}
+
+message GetAdoptedVhostContentResponse {
+  string path = 1;
+  string content = 2;
+  string file_sha256 = 3;
 }
 
 message ConvertVhostRequest {
