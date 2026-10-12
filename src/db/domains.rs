@@ -264,9 +264,9 @@ pub struct CertRow {
     pub last_error: Option<String>,
 }
 
-const SELECT_CERT: &str = "key_type, serial, UNIX_TIMESTAMP(not_before) AS not_before, \
-     UNIX_TIMESTAMP(not_after) AS not_after, UNIX_TIMESTAMP(renew_after) AS renew_after, \
-     fail_count, last_error";
+const SELECT_CERT: &str = "c.key_type, c.serial, UNIX_TIMESTAMP(c.not_before) AS not_before, \
+     UNIX_TIMESTAMP(c.not_after) AS not_after, UNIX_TIMESTAMP(c.renew_after) AS renew_after, \
+     c.fail_count, c.last_error";
 
 fn row_to_cert(row: sqlx::mysql::MySqlRow) -> CertRow {
     CertRow {
@@ -281,7 +281,7 @@ fn row_to_cert(row: sqlx::mysql::MySqlRow) -> CertRow {
 }
 
 pub async fn certificates_for(pool: &MySqlPool, domain_id: u64) -> Result<Vec<CertRow>> {
-    let rows = sqlx::query(&format!("SELECT {SELECT_CERT} FROM certificates WHERE domain_id = ?"))
+    let rows = sqlx::query(&format!("SELECT {SELECT_CERT} FROM certificates c WHERE c.domain_id = ?"))
         .bind(domain_id)
         .fetch_all(pool)
         .await?;
