@@ -65,6 +65,7 @@ struct VhostExtras {
     extra_headers: Vec<crate::vhost::render::HeaderEntry>,
     cors: Option<crate::vhost::render::CorsPolicy>,
     extra_locations: Vec<crate::vhost::render::ExtraLocation>,
+    streaming: bool,
 }
 
 impl Domains {
@@ -302,7 +303,7 @@ impl Domains {
                 .map_err(Status::from)?
                 .ok_or_else(|| Status::internal("domain vanished mid-add"))?;
             match self
-                .write_vhost(&row, &req.runner_id, req.backends.clone(), req.extra_names.clone(), req.no_http_redirect, VhostExtras::default())
+                .write_vhost(&row, &req.runner_id, req.backends.clone(), req.extra_names.clone(), req.no_http_redirect, VhostExtras { streaming: fqdn.starts_with("kae-"), ..Default::default() })
                 .await
             {
                 Ok(()) => {
@@ -348,6 +349,9 @@ impl Domains {
         };
         let fqdn = format!("{label}.{zone}");
 
+        if crate::reserved::SERVICE_PREFIXES.iter().any(|p| label.starts_with(&format!("{p}-"))) {
+            return Ok((fqdn, Some("that name is reserved".to_owned())));
+        }
         let rules = reserved_db::rules(&self.pool).await.map_err(Status::from)?;
         if crate::reserved::reserved_by(&rules, &label).is_some() {
             return Ok((fqdn, Some("that name is reserved".to_owned())));
@@ -370,6 +374,20 @@ impl Domains {
         notes: &mut Vec<String>,
     ) -> (Option<String>, bool) {
         crate::dns::write::write_records(&self.config, &self.secrets, fqdn, records, notes).await
+    }
+
+    /// The domain's Cloudflare zone: the stored id, else look the apex up in our account and remember it.
+    /// Scanner-imported and BYO rows are recorded without one even when we hold the zone.
+    async fn zone_id_for(&self, domain: &inventory_db::InventoryRow) -> Result<String, Status> {
+        if let Some(id) = dns_records_db::zone_id_for(&self.pool, domain.id).await.map_err(Status::from)? {
+            return Ok(id);
+        }
+        let no_zone = || Status::failed_precondition(format!("{}: no Cloudflare zone yet", domain.fqdn));
+        let apex = crate::inventory::model::registrable_domain(&domain.fqdn).ok_or_else(no_zone)?;
+        let cf = crate::cloudflare::CfSuite::new(&self.config, &self.secrets).map_err(Status::from)?;
+        let zone = crate::cloudflare::zones::find(&cf.zones, &apex).await.map_err(Status::from)?.ok_or_else(no_zone)?;
+        dns_records_db::set_zone_id(&self.pool, domain.id, &zone.id).await.map_err(Status::from)?;
+        Ok(zone.id)
     }
 
     async fn add_domain_response(
@@ -444,6 +462,7 @@ impl Domains {
         spec.extra_headers = extras.extra_headers;
         spec.cors = extras.cors;
         spec.extra_locations = extras.extra_locations;
+        spec.streaming = extras.streaming;
 
         let outcome = crate::vhost::attach_and_record(&self.config, &self.pool, existing.id, &spec).await?;
 
@@ -1662,8 +1681,8 @@ impl DomainService for Domains {
                     Ok(crate::vhost::render::ExtraLocation { path: l.path, kind })
                 })
                 .collect::<Result<Vec<_>, Status>>()?,
+            streaming: false,
         };
-
         self.write_vhost(
             &existing,
             &req.runner_id,
@@ -2022,10 +2041,7 @@ impl DomainService for Domains {
         self.require_domain_grant(&claims, existing.id, Action::Write).await?;
 
         let record = req.record.ok_or_else(|| Status::invalid_argument("record is required"))?;
-        let zone_id = dns_records_db::zone_id_for(&self.pool, existing.id)
-            .await
-            .map_err(Status::from)?
-            .ok_or_else(|| Status::failed_precondition(format!("{}: no Cloudflare zone yet", existing.fqdn)))?;
+        let zone_id = self.zone_id_for(&existing).await?;
 
         let cf = crate::cloudflare::CfSuite::new(&self.config, &self.secrets).map_err(Status::from)?;
         let ttl = record.ttl.max(1);
@@ -2094,10 +2110,7 @@ impl DomainService for Domains {
             .ok_or_else(|| Status::not_found("no such DNS record on this domain"))?;
 
         let record = req.record.ok_or_else(|| Status::invalid_argument("record is required"))?;
-        let zone_id = dns_records_db::zone_id_for(&self.pool, existing.id)
-            .await
-            .map_err(Status::from)?
-            .ok_or_else(|| Status::failed_precondition(format!("{}: no Cloudflare zone", existing.fqdn)))?;
+        let zone_id = self.zone_id_for(&existing).await?;
 
         let cf = crate::cloudflare::CfSuite::new(&self.config, &self.secrets).map_err(Status::from)?;
         let ttl = record.ttl.max(1);
@@ -2167,10 +2180,7 @@ impl DomainService for Domains {
             .map_err(Status::from)?
             .ok_or_else(|| Status::not_found("no such DNS record on this domain"))?;
 
-        let zone_id = dns_records_db::zone_id_for(&self.pool, existing.id)
-            .await
-            .map_err(Status::from)?
-            .ok_or_else(|| Status::failed_precondition(format!("{}: no Cloudflare zone", existing.fqdn)))?;
+        let zone_id = self.zone_id_for(&existing).await?;
 
         let cf = crate::cloudflare::CfSuite::new(&self.config, &self.secrets).map_err(Status::from)?;
         crate::cloudflare::dns::delete(&cf.zones, &zone_id, &current.cf_record_id).await.map_err(Status::from)?;
@@ -2506,6 +2516,70 @@ impl DomainService for Domains {
             ..Default::default()
         };
         self.add_subdomain(&claims, &add, &fqdn, &parent, Some(org)).await
+    }
+
+    /// Super only: the platform provisions a service host for an organization on the free zone. See the proto.
+    async fn provision_service_host(
+        &self,
+        request: Request<ProvisionServiceHostRequest>,
+    ) -> Result<Response<AddDomainResponse>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+        require_super(claims.role, "provisioning a service host")?;
+
+        if !crate::reserved::SERVICE_PREFIXES.contains(&req.service.as_str()) {
+            return Err(Status::invalid_argument(format!("unknown service {:?}", req.service)));
+        }
+        let org = authz::real_org(&req.organization_id)
+            .ok_or_else(|| Status::invalid_argument("organization_id is required"))?
+            .to_owned();
+        if req.service == "kae" && req.project_id.is_empty() {
+            return Err(Status::invalid_argument("project_id is required for kae"));
+        }
+
+        let zone = self.free_zone()?;
+        let label = crate::reserved::service_label(&req.service, &org);
+        let fqdn = format!("{label}.{zone}");
+
+        let existing = inventory_db::find_domain(&self.pool, &fqdn).await.map_err(Status::from)?.filter(|r| r.status != "removed");
+        let response = match existing {
+            Some(row) if row.organization_id.as_deref() == Some(org.as_str()) => {
+                self.add_domain_response(&fqdn, AddDomainOutcome::Provisioned, vec!["Already provisioned.".to_owned()], Vec::new(), false)
+                    .await?
+            }
+            // A 48-bit hash collision between two organizations: refuse rather than hand one the other's host.
+            Some(_) => return Err(Status::already_exists(format!("{fqdn} belongs to another organization"))),
+            None => {
+                let parent = inventory_db::find_domain(&self.pool, &zone)
+                    .await
+                    .map_err(Status::from)?
+                    .filter(|row| row.status != "removed")
+                    .ok_or_else(|| Status::failed_precondition(format!("{zone} is not set up as a managed domain yet")))?;
+                let fz = &self.config.free_zone;
+                let backends = if req.service == "kae" && !fz.kaelum_host.is_empty() {
+                    vec![Backend { host: fz.kaelum_host.clone(), port: u32::from(fz.kaelum_port), ..Default::default() }]
+                } else {
+                    Vec::new()
+                };
+                let add = AddDomainRequest { backends, ..Default::default() };
+                self.add_subdomain(&claims, &add, &fqdn, &parent, Some(org.clone())).await?
+            }
+        };
+
+        if req.service == "kae" {
+            crate::tenant_source::register(&self.pool, &label, &org, &req.project_id, &[fqdn], None)
+                .await
+                .map_err(Status::from)?;
+        }
+        Ok(response)
+    }
+
+    async fn park_zone(&self, request: Request<ParkZoneRequest>) -> Result<Response<ParkZoneResponse>, Status> {
+        let req = request.into_inner();
+        let claims = self.caller(&req.access_token).await?;
+        require_super(claims.role, "parking the free zone")?;
+        let notes = crate::park::park_zone(&self.config, &self.secrets, &self.pool, req.dry_run).await.map_err(Status::from)?;
+        Ok(Response::new(ParkZoneResponse { notes }))
     }
 
     async fn list_adopted_vhosts(

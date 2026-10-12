@@ -177,6 +177,8 @@ pub struct VhostSpec {
     /// its vhost must include `example_cert.conf` rather than a snippet for a
     /// certificate that was never issued.
     pub cert_zone: Option<String>,
+    /// Long-lived streamed responses (LLM tokens): no buffering, long read timeout.
+    pub streaming: bool,
 }
 
 impl VhostSpec {
@@ -191,6 +193,7 @@ impl VhostSpec {
             cors: None,
             extra_locations: Vec::new(),
             cert_zone: None,
+            streaming: false,
         }
     }
 
@@ -331,6 +334,9 @@ pub fn render(config: &Config, spec: &VhostSpec) -> Result<String> {
     ));
     if spec.tls() && spec.skip_tls_verify() {
         out.push_str("\x20       proxy_ssl_verify off;\n");
+    }
+    if spec.streaming {
+        out.push_str("\x20       proxy_buffering off;\n\x20       proxy_read_timeout 600s;\n");
     }
     out.push_str("\x20   }\n");
 

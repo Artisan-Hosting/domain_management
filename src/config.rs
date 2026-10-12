@@ -59,11 +59,14 @@ pub struct Config {
 pub struct FreeZone {
     /// Empty turns free addresses off.
     pub zone: String,
+    /// Where Kaelum's proxy listens (`proxy_bind_addr`). `kae-…` hosts get a vhost to it; empty host = DNS only.
+    pub kaelum_host: String,
+    pub kaelum_port: u16,
 }
 
 impl Default for FreeZone {
     fn default() -> Self {
-        Self { zone: String::new() }
+        Self { zone: String::new(), kaelum_host: String::new(), kaelum_port: 8001 }
     }
 }
 

@@ -64,6 +64,10 @@ pub async fn serve(config: Config, secrets: Secrets, pool: MySqlPool) -> Result<
     let worker = crate::worker::Worker::new(pool.clone(), config.clone(), secrets.clone())?;
     let worker_task = tokio::spawn(worker.run());
 
+    let tenants = crate::tenant_source::TenantSourceService::new(
+        pool.clone(),
+        crate::billing::BillingClient::new(&config.billing.grpc_addr)?,
+    );
     let reflection_enabled = config.grpc.reflection;
     let service = service::Domains::new(config, secrets, pool)?;
 
@@ -71,7 +75,9 @@ pub async fn serve(config: Config, secrets: Secrets, pool: MySqlPool) -> Result<
         .tls_config(tls_config)
         .map_err(|e| Error::Config(format!("failed to configure TLS: {e}")))?;
 
-    let mut router = builder.add_service(DomainServiceServer::new(service));
+    let mut router = builder
+        .add_service(DomainServiceServer::new(service))
+        .add_service(crate::proto::tenant_source::tenant_source_server::TenantSourceServer::new(tenants));
 
     if reflection_enabled {
         let reflection = tonic_reflection::server::Builder::configure()

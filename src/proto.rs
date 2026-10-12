@@ -25,3 +25,8 @@ pub mod accounts {
 pub mod billing {
     tonic::include_proto!("billing");
 }
+
+/// The generated `tenant_source` module -- the service project_Kaelum polls for its tenants.
+pub mod tenant_source {
+    tonic::include_proto!("tenant_source");
+}

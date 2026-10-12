@@ -55,6 +55,27 @@ enum Command {
     /// Run the gRPC service and its background workers (the default).
     Serve,
 
+    /// Create or update a Kaelum tenant and point existing domains at it.
+    KaelumTenant {
+        endpoint_id: String,
+        #[arg(long)]
+        organization: String,
+        #[arg(long)]
+        project: String,
+        /// A recorded domain of the organization; repeat for more.
+        #[arg(long = "host", required = true)]
+        hosts: Vec<String>,
+        /// Block the tenant (`out_of_credit`, `maintenance`, or a reason). Omit to follow Billing.
+        #[arg(long)]
+        suspension: Option<String>,
+    },
+
+    /// Point `*.<free zone>` at the edge and install the catch-all "nothing here yet" vhost.
+    ParkZone {
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Apply pending database migrations and exit.
     Migrate,
 
@@ -187,6 +208,20 @@ async fn run(cli: Cli) -> Result<()> {
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => serve(config, secrets).await,
+        Command::KaelumTenant { endpoint_id, organization, project, hosts, suspension } => {
+            let pool = db::connect(&secrets.database_url).await?;
+            ais_domains::tenant_source::register(&pool, &endpoint_id, &organization, &project, &hosts, suspension.as_deref())
+                .await?;
+            log!(LogLevel::Info, "tenant {} registered with {} host(s)", endpoint_id, hosts.len());
+            Ok(())
+        }
+        Command::ParkZone { dry_run } => {
+            let pool = db::connect(&secrets.database_url).await?;
+            for note in ais_domains::park::park_zone(&config, &secrets, &pool, dry_run).await? {
+                log!(LogLevel::Info, "{}", note);
+            }
+            Ok(())
+        }
         Command::Migrate => {
             let pool = db::connect(&secrets.database_url).await?;
             db::migrate(&pool).await?;

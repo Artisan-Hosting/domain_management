@@ -97,6 +97,16 @@ service DomainService {
   // DNS, and attaches it to the runner when backends are given.
   rpc CheckFreeName(CheckFreeNameRequest) returns (CheckFreeNameResponse);
   rpc ClaimFreeAddress(ClaimFreeAddressRequest) returns (AddDomainResponse);
+
+  // --- free zone: platform service hosts (Super only) -------------------
+  // `<svc>-<12 hex of the organization id>.<free zone>`, e.g. kae-aabbccd3a2c4.arhst.net. Records the name for the
+  // organization under the free zone and, for `kae`, registers the Kaelum tenant. Idempotent: the label is derived,
+  // so asking again for the same organization and service returns the same host.
+  rpc ProvisionServiceHost(ProvisionServiceHostRequest) returns (AddDomainResponse);
+
+  // Super only. Points `*.<free zone>` at the edge and installs the catch-all "nothing here yet" vhost. Safe to
+  // repeat: nothing that already exists is overwritten. Same work as `ais_domains park-zone`.
+  rpc ParkZone(ParkZoneRequest) returns (ParkZoneResponse);
 }
 
 // ---------------------------------------------------------------------
@@ -849,4 +859,22 @@ message ClaimFreeAddressRequest {
   string runner_id = 3;
   // Where to send traffic. Empty records the name without a vhost; AttachDomain adds it later.
   repeated Backend backends = 4;
+}
+
+message ProvisionServiceHostRequest {
+  string access_token = 1;
+  // "kae" (Kaelum). The only service so far.
+  string service = 2;
+  string organization_id = 3;
+  // kae: the session-manager project the tenant's pods are created under.
+  string project_id = 4;
+}
+
+message ParkZoneRequest {
+  string access_token = 1;
+  bool dry_run = 2;
+}
+
+message ParkZoneResponse {
+  repeated string notes = 1;
 }

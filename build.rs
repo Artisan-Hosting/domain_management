@@ -49,5 +49,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .compile_protos(&["proto/billing.proto"], &["proto"])?;
 
+    // === tenant_source.proto, served to project_Kaelum (copy of its proto/tenant_source.proto) ===
+    println!("cargo:rerun-if-changed=proto/tenant_source.proto");
+    tonic_prost_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .compile_protos(&["proto/tenant_source.proto"], &["proto"])?;
+
     Ok(())
 }

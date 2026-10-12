@@ -1,0 +1,96 @@
+syntax = "proto3";
+
+package tenant_source;
+
+// The upstream system that knows which tenants Kaelum serves.
+//
+// Kaelum calls ListTenants about every 30 seconds and keeps serving the last answer
+// it got if a call fails, so this service can be briefly unavailable without
+// interrupting anyone. See docs/06-TENANT-SOURCE-SPEC.md for the full contract.
+service TenantSource {
+  // The complete, current set of tenants. An authoritative snapshot, not a delta:
+  // a tenant that is not listed is treated as removed.
+  rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse);
+}
+
+message ListTenantsRequest {
+  // The credential Kaelum was issued for this call, as it sends to the session manager.
+  string service_credential = 1;
+}
+
+message ListTenantsResponse {
+  repeated Tenant tenants = 1;
+  // Optional. Changes whenever the contents change; used for logging only.
+  string version = 2;
+}
+
+message Tenant {
+  // --- required -------------------------------------------------------------------
+
+  // Stable identifier. 1 to 64 characters of letters, digits, '-', '_' and '.'.
+  // It keys the tenant's keys, ledger and pods, so it must never change or be reused.
+  string endpoint_id = 1;
+
+  // Hostnames that reach this tenant: lowercase, no port, unique across all tenants.
+  // At least one. (Wildcards are not supported; list each name.)
+  repeated string hostnames = 2;
+
+  // The organization (in ais_auth) that owns the tenant. Only admins of this
+  // organization, and Super, can use the tenant's /control routes.
+  string organization_id = 3;
+
+  // The project the tenant's pods are created under in the session manager. Kaelum's
+  // service credential needs Control on it.
+  string project_id = 4;
+
+  // --- optional -------------------------------------------------------------------
+
+  // Blocks the tenant. Empty means active. "out_of_credit" answers requests with 429
+  // insufficient_quota; "maintenance" with 503; any other text with 403 and that text
+  // as the reason. A blocked tenant's pod is released and none is started.
+  optional string suspension = 5;
+
+  // Models the tenant may use (names with or without ":latest"). Empty means all.
+  repeated string allowed_models = 6;
+
+  // What to run for this tenant. Anything left unset uses Kaelum's own default.
+  optional Deployment deployment = 7;
+
+  // How the tenant behaves. Anything left unset uses Kaelum's own default.
+  optional Behavior behavior = 8;
+}
+
+// How the tenant's pod is created (passed to the session manager's DeployTemplate).
+message Deployment {
+  optional string template_id = 1;
+  optional string image_name = 2;
+  optional string applet_id = 3;
+  optional string backend = 4;
+  optional string region = 5;
+  optional uint32 gpu_count = 6;
+  optional uint32 target_vram_gb = 7;
+  // "exact" or "cheapest".
+  optional string gpu_allocation_mode = 8;
+  optional uint32 volume_gb = 9;
+  optional uint32 container_disk_gb = 10;
+  // Port Ollama listens on inside the pod.
+  optional uint32 ollama_port = 11;
+  map<string, string> env = 12;
+  // Secret references (never secret values) by environment variable name.
+  map<string, string> secret_refs = 13;
+  map<string, string> backend_options = 14;
+}
+
+message Behavior {
+  // Seconds without a request before the pod is released. 0 disables.
+  optional uint64 idle_timeout_secs = 1;
+  // Fallback hourly cost, in dollars, if the session manager does not state one.
+  optional double default_cost_per_hour = 2;
+  // Start a pod when Kaelum starts, instead of on the first request.
+  optional bool auto_deploy_on_start = 3;
+  // How long a released pod is held stopped for this tenant. 0 means delete it.
+  optional uint64 release_stop_ttl_secs = 4;
+  // Overrides the tag that keeps this tenant's pods apart from other tenants'.
+  // Leave unset: Kaelum derives "kaelum:<endpoint_id>". Must be unique if set.
+  optional string orphan_reuse_tag = 5;
+}

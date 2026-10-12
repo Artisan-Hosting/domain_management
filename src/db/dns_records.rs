@@ -35,6 +35,16 @@ pub async fn zone_id_for(pool: &MySqlPool, domain_id: u64) -> Result<Option<Stri
     Ok(row.and_then(|row| row.get::<Option<String>, _>("cf_zone_id")))
 }
 
+/// Remembers the zone found for a domain that was recorded without one (scanner-imported or BYO).
+pub async fn set_zone_id(pool: &MySqlPool, domain_id: u64, zone_id: &str) -> Result<()> {
+    sqlx::query("UPDATE domains SET cf_zone_id = ? WHERE id = ? AND cf_zone_id IS NULL")
+        .bind(zone_id)
+        .bind(domain_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn list(pool: &MySqlPool, domain_id: u64) -> Result<Vec<DnsRecordRow>> {
     let rows = sqlx::query(
         "SELECT id, domain_id, cf_record_id, record_type, name, content, ttl, proxied \

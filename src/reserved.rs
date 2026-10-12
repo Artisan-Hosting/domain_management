@@ -173,3 +173,23 @@ mod tests {
         assert!(customer_ids().validate().is_ok());
     }
 }
+
+/// Services that get a derived host on the free zone, by label prefix.
+pub const SERVICE_PREFIXES: &[&str] = &["kae"];
+
+/// `<svc>-<first 12 hex of SHA-256(org id)>`: stable for an organization, says nothing readable about it.
+pub fn service_label(service: &str, organization_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{service}-{}", &hex::encode(Sha256::digest(organization_id.as_bytes()))[..12])
+}
+
+#[cfg(test)]
+mod service_label_tests {
+    #[test]
+    fn derived_and_stable() {
+        let a = super::service_label("kae", "org-1");
+        assert_eq!(a, super::service_label("kae", "org-1"));
+        assert_ne!(a, super::service_label("kae", "org-2"));
+        assert!(a.starts_with("kae-") && a.len() == 16);
+    }
+}
