@@ -17,7 +17,9 @@ pub enum Action {
 
 impl Action {
     /// True when this tick wants a publish.
-    pub fn is_publish(&self) -> bool { todo!() }
+    pub fn is_publish(&self) -> bool {
+        matches!(self, Action::Publish)
+    }
 }
 
 /// Backoff schedule for failed publishes: 30 s, 60 s, 120 s, capped at 300 s.
@@ -61,22 +63,61 @@ impl Default for PublishScheduler {
 
 impl PublishScheduler {
     /// Build a scheduler with the given debounce and auto settings.
-    pub fn new(debounce_secs: u64, auto: bool) -> Self { todo!() }
+    pub fn new(debounce_secs: u64, auto: bool) -> Self {
+        Self {
+            debounce_secs,
+            auto,
+            ..Default::default()
+        }
+    }
 
     /// Record a "something changed" request at `now`.
-    pub fn on_request(&mut self, now: u64) { todo!() }
+    pub fn on_request(&mut self, now: u64) {
+        self.last_request = Some(now);
+        self.pending = true;
+    }
 
     /// Decide whether to publish now. Pure: takes the current time as input.
-    pub fn tick(&mut self, now: u64) -> Action { todo!() }
+    pub fn tick(&mut self, now: u64) -> Action {
+        if !self.auto || self.running {
+            return Action::None;
+        }
+        let pending = match self.last_request {
+            Some(last) => self.pending && now - last >= self.debounce_secs && now >= self.next_retry,
+            None => false,
+        };
+        if pending {
+            // Coalesce the burst into one publish: clear `pending` here so a
+            // request that arrives during this publish yields exactly one more.
+            self.pending = false;
+            Action::Publish
+        } else {
+            Action::None
+        }
+    }
 
     /// Mark a publish as started.
-    pub fn on_started(&mut self) { todo!() }
+    pub fn on_started(&mut self) {
+        self.running = true;
+    }
 
     /// Mark a publish as finished with outcome `ok` at time `now`.
-    pub fn on_finished(&mut self, now: u64, ok: bool) { todo!() }
+    pub fn on_finished(&mut self, now: u64, ok: bool) {
+        self.running = false;
+        if ok {
+            // A request that arrived during the publish is coalesced into one
+            // more publish after a fresh debounce window from when it finished.
+            self.last_request = Some(now);
+            self.failures = 0;
+            self.next_retry = 0;
+        } else {
+            let backoff = *BACKOFF_SECS.get(self.failures as usize)
+                .unwrap_or(&MAX_BACKOFF_SECS);
+            self.next_retry = now.saturating_add(backoff.min(MAX_BACKOFF_SECS));
+            self.failures += 1;
+        }
+    }
 }
-
-use std::sync::Arc;
 
 impl PublishScheduler {
     /// Cheap handle shared with handlers; records a request.
